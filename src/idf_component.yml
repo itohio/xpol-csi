@@ -1,0 +1,5 @@
+## Managed component dependencies pulled from the Espressif component registry.
+dependencies:
+  idf: ">=5.5.0"
+  # Espressif CSI RX-gain baseline + compensation (AGC changes otherwise look like motion).
+  espressif/esp_csi_gain_ctrl: "0.1.5"

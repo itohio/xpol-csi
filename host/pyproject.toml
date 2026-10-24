@@ -1,0 +1,13 @@
+[project]
+name = "xpol-csi-host"
+version = "0.1.0"
+description = "Diagnostic + visualization tools for the xpol-csi sensor"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "numpy>=2.0",
+    "matplotlib>=3.8",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,52 @@
+# Flash geometry (XIAO ESP32-C5 has 8MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Console on the native USB Serial/JTAG (the USB-C port)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 1 kHz tick so 10 ms CSI slotting is exact
+CONFIG_FREERTOS_HZ=1000
+
+# Channel State Information
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# TCP send buffer / window per socket: 2 segments instead of 4. The dashboard's
+# sockets otherwise held up to 4 x 5.7 KB of heap while a page loaded, and with
+# the heap near zero the Wi-Fi driver's receive allocations failed and the CSI
+# engine latched (README, "Frozen CSI").
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+
+# Buffers sized for CSI + ESP-NOW + SoftAP + one HTTP/WS client (not a busy AP).
+# Static RX buffers are permanently allocated (~1.6 KB each) so keep them modest.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+
+# Main task stack: wifi/netif/http setup, then the sensing loop (per-link spectral
+# analysis + fusion of up to 2*MAX_LINKS link results). 8 KB overflowed at 6 links.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+
+# Compiler
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Crash core dump to the coredump partition (read back with esptool, no console needed)
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+
+# WebSocket support in esp_http_server (leader pushes scene to the phone)
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# The default system-event task stack (~2.3 KB) overflows when the STA associates
+# and the AP channel switches (verbose wifi/netif event logging -> vfprintf).
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# Per-task CPU share in the health telemetry (uxTaskGetSystemState run-time
+# counters, esp_timer based). The C5 is single-core: Wi-Fi + DSP share it.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

@@ -1,0 +1,28 @@
+# Generated builds and downloaded dependencies
+.pio/
+managed_components/
+web/node_modules/
+web/dist/
+web/dist-static/
+host/build/
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Raw experiments stay on disk, outside source history
+/host/data/
+/host/void-recordings/
+
+# PlatformIO-generated configurations; keep the source defaults
+sdkconfig.*
+!sdkconfig.defaults
+
+# Local credentials and machine files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
