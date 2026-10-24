@@ -31,19 +31,27 @@ export function decodeMessage(ab) {
 }
 
 // STATUS (1 Hz, every view): both boards' load and radio state.
+// u8 type, u8 channel, u8 links_per_board, u8 max_links (link slots per board), then
+// leader and follower blocks: u8 present, u8 cpu_busy, u32 heap_free, u32 heap_min
+// (internal RAM), u32 psram_free (0 = none), i8 tx_q, u16 illum_hz, u16 csi_fps,
+// u16 csi_restarts, u8 frozen.
 export function decodeStatus(ab) {
   const r = reader(ab); r.u8();
-  const channel = r.u8(), links_per_board = r.u8(); r.u8();
+  const channel = r.u8(), links_per_board = r.u8(), max_links = r.u8();
   const board = () => {
-    const present = r.u8() !== 0, cpu = r.u8(), heap_free = r.u32(), heap_min = r.u32();
+    const present = r.u8() !== 0, cpu = r.u8(), heap_free = r.u32(), heap_min = r.u32(), psram_free = r.u32();
     const tx_q = r.i8(), illum_hz = r.u16(), csi_fps = r.u16(), csi_restarts = r.u16(), frozen = r.u8() !== 0;
-    return present ? { cpu, heap_free, heap_min, tx: tx_q === -128 ? null : tx_q / 4, illum_hz, csi_fps, csi_restarts, frozen } : null;
+    return present ? { cpu, heap_free, heap_min, psram_free, tx: tx_q === -128 ? null : tx_q / 4, illum_hz, csi_fps, csi_restarts, frozen } : null;
   };
   const leader = board(), follower = board();
-  return { type: 'status', channel, links_per_board, leader, follower };
+  return { type: 'status', channel, links_per_board, max_links, leader, follower };
 }
 
 // SCENE (4 Hz: overview, graphs, tune): current values only.
+// ... tracks, then rf: u8 n × [u8 len, label, f32 coupling, i16 rssi, u8 flags
+// (bit0 = feeds the scene), f32 long_bpm (0 = none), f32 long_snr dB], then long:
+// f32 long_window_s (0 = none yet), f32 long_detect_db, u8 n × [f32 bpm, f32 snr].
+// Long-window peaks are evidence only; presence/counts come from the 24 s tracker.
 export function decodeScene(ab) {
   const r = reader(ab); r.u8();
   const presence = r.u8() !== 0, channel = r.u8();
@@ -60,24 +68,34 @@ export function decodeScene(ab) {
   const rf = [];
   for (let n = r.u8(); n > 0; n--) {
     const label = new TextDecoder().decode(r.bytes(r.u8()));
-    rf.push({ mac: label, coupling: r.f32(), rssi: r.i16() });
+    const coupling = r.f32(), rssi = r.i16(), flags = r.u8(), long_bpm = r.f32(), long_snr = r.f32();
+    rf.push({ mac: label, coupling, rssi, scene: (flags & 1) !== 0, long_bpm, long_snr });
   }
+  const window_s = r.f32(), detect_db = r.f32(), peaks = [];
+  for (let n = r.u8(); n > 0; n--) peaks.push({ bpm: r.f32(), snr: r.f32() });
   return { type: 'scene', presence, channel, mode, active_links, heart_count, motion,
-           breather_count: breathers.length, breathers, rf };
+           breather_count: breathers.length, breathers, rf,
+           long: { window_s, detect_db, peaks } };
 }
 
 // SPECTRA (4 Hz: graphs, tune): power bins as half-dB over the median bin,
 // returned as linear power relative to the median, plus one waveform point.
+// breathing and heart: f32 fmin, u8 n, i8[n] (1 bpm bins); u8 wave_valid, f32 wave_point;
+// then the strongest still link's long-window spectrum: f32 fmin_bpm, f32 bin_bpm,
+// f32 window_s, u16 n, i8[n] (n = 0 -> lspectrum null).
 export function decodeSpectra(ab) {
   const r = reader(ab); r.u8();
-  const bins = () => {
-    const fmin = r.f32(), n = r.u8(), p = new Array(n);
+  const db = (n) => {
+    const p = new Array(n);
     for (let i = 0; i < n; i++) p[i] = 10 ** (r.i8() / 20);   // i8 = 2 x dB
-    return { fmin, df: 1, p };
+    return p;
   };
+  const bins = () => { const fmin = r.f32(); return { fmin, df: 1, p: db(r.u8()) }; };
   const spectrum = bins(), hspectrum = bins();
   const wave_valid = r.u8() !== 0, wave_point = r.f32();
-  return { type: 'spectra', spectrum, hspectrum, wave: wave_valid ? wave_point : null };
+  const fmin = r.f32(), df = r.f32(), window_s = r.f32(), n = r.u16();
+  const lspectrum = n > 0 ? { fmin, df, window_s, p: db(n) } : null;
+  return { type: 'spectra', spectrum, hspectrum, wave: wave_valid ? wave_point : null, lspectrum };
 }
 
 // RAW (4 Hz: raw): the strongest link's breathing-grid rows since the last

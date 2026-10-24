@@ -7,6 +7,7 @@
 //   CH,<t_ms>,<channel>,<second>,<band5g>
 //   CSI,<t_ms>,<src_mac>,<rssi>,<noise>,<nsub>,<a0> <a1> ... <aN-1>
 //   FEAT,<t_ms>,<src_mac>,<valid>,<motion>,<is_motion>,<cov>,<nb>,<b:snr;..>,<nh>,<h:snr;..>
+//   LONG,<t_ms>,<src_mac>,<window_s>,<nb>,<b:snr;..>          (a link's long-window analysis)
 //   SCENE,<t_ms>,<presence>,<motion>,<links>,<nb>,<b:snr;..>,<nh>,<h:snr;..>
 //
 // MACs are 12 lowercase hex digits (no colons). EVT/ROLE/CH/FEAT/SCENE always
@@ -31,6 +32,7 @@ void telem_channel(uint8_t channel, uint8_t second, bool band_5g);
 void telem_csi(const uint8_t src_mac[6], int8_t noise, const CsiFrame& f);
 void telem_iq(const uint8_t src_mac[6], int8_t noise, const CsiFrame& f);
 void telem_feat(const uint8_t src_mac[6], const LinkResult& r);
+void telem_long(const uint8_t src_mac[6], const LongResult& r);
 void telem_scene(const SceneResult& s, uint8_t channel, Mode mode);
 
 // Start the stdin command reader. 's' => on_status, 'c' => on_calibrate,

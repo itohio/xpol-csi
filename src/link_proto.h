@@ -60,6 +60,10 @@ struct MsgFeature {
     uint8_t  n_heart;
     float    heart_bpm[FEAT_MAX_HEART];
     float    heart_snr[FEAT_MAX_HEART];
+    float    long_window_s;  // still history behind the long-window peaks (0: none)
+    uint8_t  n_long;
+    float    long_bpm[FEAT_MAX_BREATH];
+    float    long_snr[FEAT_MAX_BREATH];
 };
 
 // Every transmitter the sending node's radio hears (its RF source table).
@@ -74,8 +78,9 @@ struct MsgRfSource {
 // One board's load and radio state (status bar); the follower sends its own
 // inside RF_SOURCES every 2 s.
 struct BoardStatus {
-    uint32_t heap_free;     // bytes now
-    uint32_t heap_min;      // lowest free heap over the last 2 s interval
+    uint32_t heap_free;     // internal RAM bytes now (the Wi-Fi driver's; PSRAM is psram_free)
+    uint32_t heap_min;      // lowest free internal RAM over the last 2 s interval
+    uint32_t psram_free;    // external PSRAM bytes now (0: none)
     uint8_t  cpu_busy;      // % of the last 2 s not in IDLE
     int8_t   tx_q;          // configured max TX power, 0.25 dBm units
     uint16_t illum_hz;      // ESP-NOW illumination rate (0 = off)

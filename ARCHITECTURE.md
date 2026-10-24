@@ -125,7 +125,7 @@ respiration rate.
   in `dsp.h`), taken only for the 16 selected subcarriers. Q4 matters: a breath
   moves a subcarrier's amplitude by ~1-3% (0.2-1 unit at typical 20-40), which
   whole-unit storage rounds away.
-- **Breathing decimation averages every frame of each 100 ms slot** (boxcar:
+- **Breathing decimation averages every frame of each 50 ms slot** (`DSP_DECIM_HZ`; boxcar:
   anti-alias + sqrt(N) noise reduction). The motion grid keeps the frame nearest
   each 10 ms slot center, storing only its 32 bytes of selected I/Q.
 - **Waveform / phase** use the first principal component of the linearly
@@ -142,8 +142,9 @@ Pure C++ with no IDF dependencies, so it compiles and runs unchanged on the host
 for tests (`host/test_dsp.cpp`) and in firmware.
 
 - **Per frame** (consumer task, integer only): Q4 amplitude of the 16 selected
-  subcarriers; all frames of each 100 ms slot are averaged into the 24 s
-  breathing ring; the per-frame spread across subcarriers feeds motion.
+  subcarriers; all frames of each 50 ms slot are averaged into the 24 s
+  breathing ring, and every 4 rows of it into the 10 min long history (5 Hz);
+  the per-frame spread across subcarriers feeds motion.
 - **Motion** (after ESPectre, `github.com/PeterkoCZ91/esphome-wifi-csi`):
   spread (CV) → Hampel(7) → moving variance over 100 frames; threshold P95 × 1.1
   of the calibration distribution; hysteresis 0.7 and 4/6-enter, 5/6-exit votes.
@@ -157,11 +158,26 @@ for tests (`host/test_dsp.cpp`) and in firmware.
   ≥ 14 dB over the noise floor = median of the bins outside the top peak's lobe
   / ln 2; neighbours within two lobes and 25 dB down are sidelobes. Heartbeat
   (experimental): same at 12 dB over 45–150 bpm, only with breathing present.
-- **Fusion** (`fuseLinks`) — clusters respiration rates across all links (2.5 bpm
-  of the cluster seed); each cluster is one person; cluster SNR = max over links
-  (they are not independent: same transmitters, antennas cm apart, one
-  reciprocal board-to-board channel). Motion on any link means occupancy at
-  once; breathing occupancy and counts come from the tracker's confirmed tracks.
+- **Long window**: the same principal component and periodogram over up to
+  `long window` (60–600 s, default 120) of a link's still history, with bins of
+  max(30/T, 0.1) bpm. One link per tick (oldest turn first; each every
+  max(2 s, T/30)); its rows are copied out under the lock and analysed outside
+  it with a caller-owned `LongWork` scratch. Reported per link and clustered
+  across the scene's links (`SceneResult.long_*`); evidence only, it decides
+  neither presence nor counts.
+- **Fusion** (`fuseLinks`) — clusters respiration rates across the scene's
+  links (2.5 bpm of the cluster seed); each cluster is one person; cluster SNR
+  = max over links (they are not independent: same transmitters, antennas cm
+  apart, one reciprocal board-to-board channel). Motion on any link means
+  occupancy at once; breathing occupancy and counts come from the tracker's
+  confirmed tracks. The links' peaks are visited in rate order in place, so
+  fusing 2 × 16 links needs no merged buffer on the main stack.
+- **Memory**: PSRAM is in the capability allocator only. The 16 link slots
+  per board (~112 KB each), the long-window scratch, the per-tick fusion
+  scratch (`FusionWork`), the peer's link results and the web scene are
+  allocated there at boot (`src/psram.h`); everything else (malloc, stacks,
+  Wi-Fi, lwIP, the CSI ring) stays in internal SRAM, which the health lines and
+  the web footer report.
 
 Verified on the host (`host/test_dsp.cpp`): rates recovered, two people
 counted, motion enters and clears, and noise-only windows produce no vitals.

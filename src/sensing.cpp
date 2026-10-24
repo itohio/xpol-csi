@@ -1,5 +1,6 @@
 #include "sensing.h"
 #include <math.h>
+#include "psram.h"
 #include "telemetry.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -30,10 +31,19 @@ struct Link {
     uint16_t      gain_q8_last = 256;
     uint32_t      last_hash = 0;     // FNV-1a of the last frame's I/Q (frozen-CSI detection)
     uint16_t      repeats = 0;       // consecutive frames identical to the previous one
-    LinkProcessor proc;
+    // Long-window breathing (main task only): last analysis, next one due.
+    LongResult    long_res;
+    int64_t       long_due_us = 0;
+    LinkProcessor proc;              // ~112 KB: 24 s and 10 min histories
 };
 
-Link            s_links[MAX_LINKS];
+// MAX_LINKS slots, in PSRAM (sensing_init).
+Link* s_links = nullptr;
+struct LinkSlots {
+    Link* begin() const { return s_links; }
+    Link* end() const { return s_links + MAX_LINKS; }
+};
+const LinkSlots all_links{};
 
 // Link admission (consumer task only): which transmitter/format gets one of the
 // MAX_LINKS slots. Every transmitter/format not yet a link is a candidate,
@@ -81,11 +91,20 @@ float s_y[DSP_BREATH_LEN];
 float s_best[DSP_BREATH_LEN];
 int   s_best_n = 0;
 
+// Long-window analysis (main task): its scratch and, for the web, the spectrum
+// of the strongest still link's last analysis. PSRAM (sensing_init).
+struct LongSpec { float p[LONG_SPEC_MAX]; int n; float fmin_bpm, bin_bpm, window_s; int slot; };
+LongWork* s_long = nullptr;
+LongSpec* s_long_spec = nullptr;
+// Main-task timing since the previous sensing_health(): the longest hold of
+// s_mtx (the CSI consumer waits that long) and the longest long-window analysis.
+uint32_t s_lock_max_us = 0, s_long_max_us = 0, s_long_runs = 0;
+
 // Empty-room motion thresholds per link (MAC + CSI format), persisted in NVS
 // ("xpol"/"t<mac><fmt>") so a reboot or reflash keeps the calibration.
 // Loaded once at init; keys of the older MAC-only format are erased.
 struct StoredThr { uint8_t mac[6]; uint8_t fmt; uint64_t thr; };
-FixedVec<StoredThr, 16> s_stored;
+FixedVec<StoredThr, 2 * MAX_LINKS> s_stored;
 
 void nvs_key(const uint8_t* mac, uint8_t fmt, char* key) {   // "f" + 12 + 2 hex = 15 chars (NVS max)
     static const char* hex = "0123456789abcdef";
@@ -138,7 +157,7 @@ void save_threshold(const uint8_t* mac, uint8_t fmt, uint64_t thr) {
 // another format (same geometry, little new information). Caller holds s_mtx.
 float link_score(const uint8_t* mac, uint8_t fmt, float rate, float rssi) {
     float s = link_quality_db(rate, rssi);
-    for (const auto& l : s_links)
+    for (const auto& l : all_links)
         if (l.used && !memcmp(l.mac, mac, 6) && l.fmt != fmt) { s -= 3.0f; break; }
     return s;
 }
@@ -215,7 +234,7 @@ int find_or_add(const uint8_t* mac, uint8_t fmt, int8_t rssi, int64_t now) {
         Link& l = s_links[i];
         if (l.used && l.fmt == fmt && !memcmp(l.mac, mac, 6)) { l.last_seen_us = now; return i; }
     }
-    for (auto& l : s_links)    // free links that went silent
+    for (auto& l : all_links)    // free links that went silent
         if (l.used && now - l.last_seen_us > kLinkIdleUs) l.used = false;
     return consider_candidate(mac, fmt, rssi, now);
 }
@@ -279,20 +298,24 @@ void consume_task(void*) {
 }
 
 // Tuned parameters persisted as one NVS blob: a version byte, then every table
-// entry's float in table order (a changed table invalidates old blobs).
-constexpr uint8_t kParamsVersion = 6;   // 6: "links fused" (1..2N) became "links per board" (1..N)
+// entry's float in table order (a changed table invalidates old blobs, except
+// that entries appended in version 7 leave a version 6 blob's values valid).
+constexpr uint8_t kParamsVersion = 7;   // 7: + "long window", "long SNR (detect)"; 6: "links per board" (1..N)
+constexpr int     kParamsAddedIn7 = 2;
 
 void load_params() {
-    int n; const DspParamInfo* t = dsp_param_table(&n);
+    int n; dsp_param_table(&n);
     uint8_t blob[1 + 4 * 32];
     size_t len = sizeof(blob);
     nvs_handle_t h;
     if (nvs_open("xpol", NVS_READONLY, &h) != ESP_OK) return;
-    const bool ok = nvs_get_blob(h, "params", blob, &len) == ESP_OK && len == 1 + 4 * (size_t)n && blob[0] == kParamsVersion;
+    const bool got = nvs_get_blob(h, "params", blob, &len) == ESP_OK;
     nvs_close(h);
-    if (!ok) return;
-    for (int i = 0; i < n; i++) { float v; memcpy(&v, blob + 1 + 4 * i, 4); dsp_param_set(i, v); }
-    (void)t;
+    int stored = -1;
+    if (got && blob[0] == kParamsVersion) stored = n;
+    if (got && blob[0] == 6) stored = n - kParamsAddedIn7;
+    if (stored < 0 || len != 1 + 4 * (size_t)stored) return;
+    for (int i = 0; i < stored; i++) { float v; memcpy(&v, blob + 1 + 4 * i, 4); dsp_param_set(i, v); }
 }
 
 QueueHandle_t   s_cmd_q = nullptr;
@@ -305,10 +328,16 @@ volatile bool   s_calibrating = false;
 RingbufHandle_t sensing_init() {
     load_thresholds();
     load_params();
+    s_links = psram_new_array<Link>(MAX_LINKS, "links");
+    s_long = psram_new<LongWork>("long-window scratch");
+    s_long_spec = psram_new<LongSpec>("long-window spectrum");
+    s_long_spec->slot = -1;
     s_cmd_q = xQueueCreateStatic(sizeof(s_cmd_q_mem), 1, s_cmd_q_mem, &s_cmd_q_ctl);
     s_rb = xRingbufferCreateStatic(sizeof(s_ring_mem), RINGBUF_TYPE_NOSPLIT, s_ring_mem, &s_ring_ctl);
     s_mtx = xSemaphoreCreateMutex();
     xTaskCreate(consume_task, "csi_consume", 6144, nullptr, 7, nullptr);
+    telem_comment("sensing links=%d x %u B + long scratch %u B in PSRAM (free %u B)", MAX_LINKS, (unsigned)sizeof(Link),
+                  (unsigned)sizeof(LongWork), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return s_rb;
 }
 
@@ -338,7 +367,7 @@ char sensing_take_command() {
 
 void sensing_reset_buffers() {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
-    for (auto& l : s_links) if (l.used) l.proc.resetBuffers();
+    for (auto& l : all_links) if (l.used) l.proc.resetBuffers();
     xSemaphoreGive(s_mtx);
     s_best_n = 0;
 }
@@ -350,14 +379,14 @@ void sensing_set_mode(Mode m) { s_mode = m; }
 bool sensing_take_csi_restart() {
     if (!s_csi_restart_req) return false;
     s_csi_restart_req = false;
-    for (auto& l : s_links) l.repeats = 0;   // a fresh run is needed to ask again
+    for (auto& l : all_links) l.repeats = 0;   // a fresh run is needed to ask again
     return true;
 }
 
 void sensing_begin_calibration() {
     s_calibrating = true;
     xSemaphoreTake(s_mtx, portMAX_DELAY);
-    for (auto& l : s_links) if (l.used) l.proc.beginCalibration();
+    for (auto& l : all_links) if (l.used) l.proc.beginCalibration();
     xSemaphoreGive(s_mtx);
 }
 
@@ -366,7 +395,7 @@ void sensing_finalize_calibration() {
     struct Done { uint8_t mac[6]; uint8_t fmt; uint64_t thr; };
     FixedVec<Done, MAX_LINKS> done;
     xSemaphoreTake(s_mtx, portMAX_DELAY);
-    for (auto& l : s_links) {
+    for (auto& l : all_links) {
         if (!l.used) continue;
         l.proc.finalizeCalibration();
         if (l.proc.calibrated()) {
@@ -386,30 +415,84 @@ void sensing_finalize_calibration() {
 
 // One link at a time: snapshot under the lock (motion decision + 1-D breathing
 // series, a few ms), then the spectral analysis with the lock released so the
-// CSI consumer never waits on it.
+// CSI consumer never waits on it. Then at most one long-window analysis per
+// tick: the still link whose turn is oldest copies its still history under the
+// lock and is analysed outside it. The per-tick cost stays one analysis however
+// many links there are; each is refreshed every max(2 s, window / 30).
 int sensing_snapshot(LinkView* out, int max) {
     const int64_t now = esp_timer_get_time();
-    int n = 0;
+    auto held = [](int64_t t0) {
+        const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+        if (us > s_lock_max_us) s_lock_max_us = us;
+    };
+    int n = 0, best_slot = -1, due = -1;
+    int slot_of[MAX_LINKS];
     float best_amp = -1;
     s_best_n = 0;
     for (int i = 0; i < MAX_LINKS && n < max; i++) {
+        Link& l = s_links[i];
         xSemaphoreTake(s_mtx, portMAX_DELAY);
-        if (s_links[i].used && now - s_links[i].last_seen_us > kLinkIdleUs) s_links[i].used = false;   // went silent
-        if (!s_links[i].used) { xSemaphoreGive(s_mtx); continue; }
-        memcpy(out[n].mac, s_links[i].mac, 6);
-        out[n].fmt = s_links[i].fmt;
-        const LinkSnapshot snap = s_links[i].proc.snapshot(now, s_y);
+        const int64_t t0 = esp_timer_get_time();
+        if (l.used && now - l.last_seen_us > kLinkIdleUs) l.used = false;   // went silent
+        if (!l.used) { held(t0); xSemaphoreGive(s_mtx); continue; }
+        memcpy(out[n].mac, l.mac, 6);
+        out[n].fmt = l.fmt;
+        const LinkSnapshot snap = l.proc.snapshot(now, s_y);
+        held(t0);
         xSemaphoreGive(s_mtx);
 
         out[n].result = analyzeLink(snap, s_y);
+        if (snap.n == 0) {   // moving or not still long enough: the long window starts over
+            l.long_res = LongResult();
+            l.long_due_us = 0;
+        } else if (l.long_due_us <= now && (due < 0 || l.long_due_us < s_links[slot_of[due]].long_due_us)) {
+            due = n;
+        }
         if (snap.n > 0 && snap.mean_amp > best_amp) {
             best_amp = snap.mean_amp;
+            best_slot = i;
             memcpy(s_best, s_y, sizeof(float) * snap.n);
             s_best_n = snap.n;
         }
-        n++;
+        slot_of[n++] = i;
+    }
+
+    if (best_slot != s_long_spec->slot) { s_long_spec->slot = best_slot; s_long_spec->n = 0; }
+    if (due >= 0) {
+        Link& l = s_links[slot_of[due]];
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        const int64_t t0 = esp_timer_get_time();
+        // The consumer may have given the slot to another transmitter meanwhile.
+        const bool same = l.used && l.fmt == out[due].fmt && !memcmp(l.mac, out[due].mac, 6);
+        const int rows = same ? l.proc.stillLongRows(now, s_long->rows, (int)(g_dsp.long_window_s * LONG_HZ)) : 0;
+        const int m = l.proc.nSel();
+        held(t0);
+        xSemaphoreGive(s_mtx);
+        const int64_t t1 = esp_timer_get_time();
+        l.long_res = analyzeLong(*s_long, rows, m);
+        const uint32_t us = (uint32_t)(esp_timer_get_time() - t1);
+        if (us > s_long_max_us) s_long_max_us = us;
+        s_long_runs++;
+        l.long_due_us = now + (int64_t)(std::max(2.0f, l.long_res.window_s / 30.0f) * 1e6f);
+        if (slot_of[due] == best_slot) {
+            LongSpec& sp = *s_long_spec;
+            sp.n = s_long->n_spec;
+            memcpy(sp.p, s_long->spectrum, sizeof(float) * sp.n);
+            sp.fmin_bpm = s_long->spec_fmin_bpm; sp.bin_bpm = s_long->spec_bin_bpm; sp.window_s = l.long_res.window_s;
+        }
+        if (l.long_res.window_s > 0) telem_long(l.mac, l.long_res);
+    }
+    for (int k = 0; k < n; k++) {
+        const LongResult& r = s_links[slot_of[k]].long_res;
+        out[k].result.long_window_s = r.window_s;
+        out[k].result.long_breaths = r.breaths;
     }
     return n;
+}
+
+LongSpectrum sensing_long_spectrum() {
+    const LongSpec& s = *s_long_spec;
+    return {s.fmin_bpm, s.bin_bpm, s.window_s, s.n, s.p};
 }
 
 FixedVec<float, SPEC_MAX> sensing_spectrum() { return breathSpectrum(s_best, s_best_n); }
@@ -424,9 +507,10 @@ bool  sensing_csi_frozen() { return esp_timer_get_time() - s_last_frozen_us < 30
 SensingHealth sensing_health() {
     SensingHealth h{radio_csi_drops(), radio_csi_written(), s_max_backlog,
                     (uint32_t)sizeof(s_ring_mem), (uint32_t)(sizeof(s_ring_mem) - xRingbufferGetCurFreeSize(s_rb)),
-                    s_ring_peak};
+                    s_ring_peak, s_lock_max_us, s_long_max_us, s_long_runs};
     s_max_backlog = 0;
     s_ring_peak = 0;
+    s_lock_max_us = s_long_max_us = s_long_runs = 0;
     return h;
 }
 

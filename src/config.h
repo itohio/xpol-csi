@@ -61,11 +61,14 @@
 #define MAX_SUBCARRIERS          128   // max incoming CSI subcarriers per sample
 #define DSP_NSEL                  16   // subcarriers stored/analyzed per link
 #ifndef MAX_LINKS
-#define MAX_LINKS                  3   // sensing links per board; build flag (platformio.ini sensing_flags)
+#define MAX_LINKS                 16   // link slots per board (PSRAM); build flag (platformio.ini sensing_flags)
 #endif
+#define LINKS_PER_BOARD            3   // default "links per board" feeding the scene (tune tab, 1..MAX_LINKS)
 #ifndef DSP_DECIM_HZ
 #define DSP_DECIM_HZ              20   // breathing/heart grid (multiple of 5); build flag. Ring per link =
 #endif                                 // BREATH_WIN_SEC x DSP_DECIM_HZ x DSP_NSEL x 2 B (15.4 KB at 20 Hz)
+// Long history per link (dsp.h LONG_*): LONG_HIST_SEC (600 s) at LONG_HZ (5 Hz) x DSP_NSEL x 2 B = 96 KB, in
+// PSRAM. A still window of up to "long window" s of it is analysed for breathing, one link per tick.
 #define BREATH_WIN_SEC             24
 #define BREATH_FMIN_HZ          0.12f   // ~7 breaths/min
 #define BREATH_FMAX_HZ          0.70f   // ~42 breaths/min

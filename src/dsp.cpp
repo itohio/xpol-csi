@@ -38,6 +38,9 @@ static const DspParamInfo kParams[] = {
     {"hampel k",            "MAD",    "motion",    1.0f, 10.0f, 0.25f, &DspParams::hampel_k},
     {"min link rate",       "fr/s",   "link",      0.0f, 100.0f, 1.0f, &DspParams::min_link_rate},
     {"links per board",     "max",    "link",      1.0f, (float)MAX_LINKS, 1.0f, &DspParams::links_per_board},
+    // Appended (saved blobs keep their order): long-window breathing evidence.
+    {"long window",         "s",      "long-window", 60.0f, (float)LONG_HIST_SEC, 10.0f, &DspParams::long_window_s},
+    {"long SNR (detect)",   "dB",     "long-window", 6.0f, 30.0f, 0.5f, &DspParams::long_snr_db},
 };
 
 const DspParamInfo* dsp_param_table(int* count) {
@@ -83,12 +86,13 @@ LinkProcessor::LinkProcessor() {}
 void LinkProcessor::reset() {
     n_sub_ = 0; n_sel_ = 0; seeded_ = false; last_rssi_ = 0; rssi_ema_q8_ = 0;
     bhead_ = 0; bcount_ = 0; rows_total_ = 0; last_breath_slot_ = -1;
+    lhead_ = 0; lcount_ = 0; memset(lacc_, 0, sizeof(lacc_)); lacc_n_ = 0;
     memset(bacc_, 0, sizeof(bacc_)); bacc_n_ = 0;
     hamp_n_ = 0; hamp_i_ = 0;
     mv_i_ = 0; mv_n_ = 0; mv_s_ = 0; mv_ss_ = 0; mv_q32_ = 0;
     amp_ema_ = 0; frames_ = 0;
     thr_q32_ = kMotionDefaultQ32; calibrating_ = false; calibrated_ = false; calib_.clear();
-    motion_ = false; votes_ = 0; last_motion_us_ = -1;
+    motion_ = false; votes_ = 0; last_motion_us_ = -1; vitals_ok_ = false;
     rate_t_us_ = -1; rate_frames_ = 0; pkt_rate_ = 0; rate_ok_ = false;
 }
 
@@ -155,11 +159,11 @@ void LinkProcessor::push(const CsiFrame& f) {
     if (bslot != last_breath_slot_) {
         const int64_t gap = last_breath_slot_ < 0 ? 0 : bslot - last_breath_slot_ - 1;
         flushBreathSlot();
-        for (int64_t g = 0; g < std::min<int64_t>(gap, kBreathLen) && bcount_ > 0; g++) {
-            memcpy(bring_[bhead_], bring_[(bhead_ + kBreathLen - 1) % kBreathLen], sizeof(bring_[0]));
-            bhead_ = (bhead_ + 1) % kBreathLen;
-            if (bcount_ < kBreathLen) bcount_++;
-            rows_total_++;
+        // Up to the long history's span (a silent link is freed long before that).
+        for (int64_t g = 0; g < std::min<int64_t>(gap, (int64_t)kLongLen * kLongDecim) && bcount_ > 0; g++) {
+            int16_t prev[DSP_NSEL];
+            memcpy(prev, bring_[(bhead_ + kBreathLen - 1) % kBreathLen], sizeof(prev));
+            storeRow(prev);
         }
         last_breath_slot_ = bslot;
     }
@@ -219,14 +223,29 @@ void LinkProcessor::motionSample(int32_t x) {
 // Close the breathing slot: store the mean of its frames (rounded, Q4).
 void LinkProcessor::flushBreathSlot() {
     if (bacc_n_ == 0) return;
+    int16_t row[DSP_NSEL] = {};
     for (int j = 0; j < n_sel_; j++) {
-        bring_[bhead_][j] = (int16_t)((bacc_[j] + bacc_n_ / 2) / bacc_n_);
+        row[j] = (int16_t)((bacc_[j] + bacc_n_ / 2) / bacc_n_);
         bacc_[j] = 0;
     }
     bacc_n_ = 0;
+    storeRow(row);
+}
+
+void LinkProcessor::storeRow(const int16_t* row) {
+    memcpy(bring_[bhead_], row, sizeof(bring_[0]));
     bhead_ = (bhead_ + 1) % kBreathLen;
     if (bcount_ < kBreathLen) bcount_++;
     rows_total_++;
+    for (int j = 0; j < n_sel_; j++) lacc_[j] += row[j];
+    if (++lacc_n_ < kLongDecim) return;
+    for (int j = 0; j < n_sel_; j++) {
+        lring_[lhead_][j] = (int16_t)((lacc_[j] + kLongDecim / 2) / kLongDecim);
+        lacc_[j] = 0;
+    }
+    lacc_n_ = 0;
+    lhead_ = (lhead_ + 1) % kLongLen;
+    if (lcount_ < kLongLen) lcount_++;
 }
 
 LinkSnapshot LinkProcessor::snapshot(int64_t now_us, float* y) {
@@ -272,7 +291,8 @@ LinkSnapshot LinkProcessor::snapshot(int64_t now_us, float* y) {
     // still hold the motion transient, which would dominate PC1 and the spectrum);
     // analyzeLink needs >= 12 s of it, so vitals appear 12-24 s after settling.
     const int since_still = (int)std::min<int64_t>((now_us - last_motion_us_) / (1000000 / DSP_DECIM_HZ), kBreathLen);
-    s.n = (full && !motion_ && s.idle_s >= g_dsp.breath_idle_s) ? breathComponent(y, since_still) : 0;
+    vitals_ok_ = full && !motion_ && s.idle_s >= g_dsp.breath_idle_s;
+    s.n = vitals_ok_ ? breathComponent(y, since_still) : 0;
     return s;
 }
 
@@ -297,14 +317,12 @@ float LinkProcessor::meanAmp() const {
 // most of the variance, so PC1 follows them and their 1/f skirt fills the
 // breathing band. With L = 8 s: DC removed, 1.2 bpm -28 dB, 3 bpm -12 dB,
 // 7 bpm -0.7 dB. Integer only: running window sums per subcarrier and one
-// division per sample, straight off the ring; a 16x16 power iteration; a Q12
-// projection.
-int LinkProcessor::breathComponent(float* y, int max_rows) const {
-    const int n = std::min(bcount_, max_rows), m = n_sel_;
-    if (n < DSP_DECIM_HZ * 2 || m == 0) return 0;
-    auto row = [&](int i) { return bring_[(bhead_ - n + i + 2 * kBreathLen) % kBreathLen]; };
-    const int h = (int)lrintf(g_dsp.hp_window_s * DSP_DECIM_HZ * 0.5f);   // half window, rows
-
+// division per sample, straight off the rows; a 16x16 power iteration; a Q12
+// projection. row(i) = the i-th of n rows (oldest first), m columns; h = half
+// the low-cut window in rows. Shared by the 24 s window (the ring, under the
+// link lock) and the long window (a copy, outside it).
+template <class Row>
+static int principalComponent(Row row, int n, int m, int h, float* y) {
     // Visit rows 0..n-1 with their high-passed values hp[j] = x - round(mean of
     // rows [i-h, i+h] clipped to the window). |hp| < 2^16 (Q4 amplitudes < 2^15).
     auto for_each_hp = [&](auto&& f) {
@@ -323,7 +341,7 @@ int LinkProcessor::breathComponent(float* y, int max_rows) const {
         }
     };
 
-    // Sums for mean and covariance (products < 2^32 in int64, n <= 480 terms).
+    // Sums for mean and covariance (products < 2^32 in int64, n <= DSP_LONG_LEN terms < 2^44).
     // Symmetric matrices are stored as packed upper triangles to keep this off
     // the caller's stack budget.
     constexpr int kTri = DSP_NSEL * (DSP_NSEL + 1) / 2;
@@ -381,6 +399,22 @@ int LinkProcessor::breathComponent(float* y, int max_rows) const {
     return n;
 }
 
+int LinkProcessor::breathComponent(float* y, int max_rows) const {
+    const int n = std::min(bcount_, max_rows);
+    if (n < DSP_DECIM_HZ * 2 || n_sel_ == 0) return 0;
+    auto row = [&](int i) -> const int16_t* { return bring_[(bhead_ - n + i + 2 * kBreathLen) % kBreathLen]; };
+    return principalComponent(row, n, n_sel_, (int)lrintf(g_dsp.hp_window_s * DSP_DECIM_HZ * 0.5f), y);
+}
+
+int LinkProcessor::stillLongRows(int64_t now_us, int16_t (*out)[DSP_NSEL], int max_rows) const {
+    if (!vitals_ok_ || n_sel_ == 0 || max_rows <= 0) return 0;
+    const int since_still = (int)std::min<int64_t>((now_us - last_motion_us_) / (1000000 / LONG_HZ), kLongLen);
+    const int n = std::min(std::min(since_still, lcount_), max_rows);
+    for (int i = 0; i < n; i++)
+        memcpy(out[i], lring_[(lhead_ - n + i + 2 * kLongLen) % kLongLen], sizeof(int16_t) * n_sel_);
+    return n;
+}
+
 int LinkProcessor::rowsSince(uint32_t* cursor, int16_t* out, int max_rows) const {
     const int m = n_sel_;
     if (m == 0 || max_rows <= 0) return 0;
@@ -410,14 +444,14 @@ static int breathBins() { return std::min(SPEC_MAX, (int)(g_dsp.breath_fmax_bpm 
 static int heartBins() { return std::min(kHeartMaxBins, (int)(g_dsp.heart_fmax_bpm - g_dsp.heart_fmin_bpm) + 1); }
 
 // y[0..n) -> x: block-mean decimated by d (boxcar anti-alias, newest kept),
-// optionally Hann-windowed, scaled to |x| <= 2^15. One float pass per call;
+// optionally Hann-windowed, scaled to |x| <= full. One float pass per call;
 // everything per bin after this is integer. Returns length.
-static int prep(const float* y, int n, int d, bool window, int32_t* x) {
+static int prep(const float* y, int n, int d, bool window, int32_t* x, float full = 32767.0f) {
     const int m = n / d, start = n - m * d;
     float mx = 0;
     for (int i = 0; i < n; i++) mx = std::max(mx, fabsf(y[i]));
     if (m < 2 || mx <= 0) return 0;
-    const float sc = 32767.0f / (mx * d);
+    const float sc = full / (mx * d);
     const float th = 2.0f * (float)M_PI / (float)(m - 1), cr = cosf(th), sr = sinf(th);
     float c = 1.0f, s = 0.0f;   // Hann by rotation recurrence: no cosf per sample
     for (int i = 0; i < m; i++) {
@@ -431,7 +465,9 @@ static int prep(const float* y, int n, int d, bool window, int32_t* x) {
 }
 
 // Integer Goertzel: Q29 coefficient, int32 state, 64-bit products. The state is
-// bounded by n|x|/sin(w) < 480 * 2^15 / sin(2pi 0.12/5) < 2^27 for these bands.
+// bounded by n|x|/sin(w): < 480 * 2^15 / sin(2pi 0.12/5) < 2^27 for the 24 s
+// bands; the long window keeps |x| <= 2^14, so DSP_LONG_LEN (3000) samples down
+// to the 4 bpm band minimum stay < 3000 * 2^14 / sin(2pi 0.067/5) < 2^30.
 struct GState { int32_t s1, s2; int32_t c; };
 static GState goertzel(const int32_t* x, int n, float f, float fs) {
     GState g{0, 0, (int32_t)lrintf(2.0f * cosf(2.0f * (float)M_PI * f / fs) * (float)(1 << 29))};
@@ -469,28 +505,30 @@ static bool nearHarmonic(float rate, float base, int kmin, int kmax, float tol_b
     return false;
 }
 
-// Peaks of P[0..nb) (bin b = f0_hz + b/60 Hz) more than thr_db above the noise
-// floor. The bins are 1 bpm apart but the 24 s Hann window resolves 2.5 bpm,
-// so a peak's main lobe spans +-5 bins: those are excluded around the strongest
-// bin, and the floor is the median of the rest / ln 2 (median of the exponential
-// periodogram of noise = ln 2 x its mean), which a second peak's lobe shifts
-// far less than a mean would. Only interior local maxima count: an edge bin is
-// leakage from outside the band (drift, motion).
+// Peaks of P[0..nb) (bin b = f0_hz + b * bin_hz) more than thr_db above the
+// noise floor. The 24 s Hann window resolves 2.5 bpm with 1 bpm bins, so a
+// peak's main lobe spans lobe_bins = +-5 bins: those are excluded around the
+// strongest bin, and the floor is the median of the rest / ln 2 (median of the
+// exponential periodogram of noise = ln 2 x its mean), which a second peak's
+// lobe shifts far less than a mean would. Only interior local maxima count: an
+// edge bin is leakage from outside the band (drift, motion).
 // Weaker peaks within 3 bpm of, or at 2x/3x, a stronger accepted peak are
 // dropped; with `avoid`, so are 1x..8x harmonics of those rates (heart band).
 static constexpr int kLobeBins = 5;
-static void findPeaks(const float* P, int nb, float f0_hz, float thr_db,
+static float s_rest[std::max(kHeartMaxBins, LONG_SPEC_MAX)];   // main-task scratch
+static void findPeaks(const float* P, int nb, float f0_hz, float bin_hz, int lobe_bins, float thr_db,
                       const FixedVec<SpectralPeak, MAX_PEAKS>* avoid,
                       FixedVec<SpectralPeak, MAX_PEAKS>& out) {
-    if (nb < 2 * kLobeBins + 5) return;
+    if (nb < 2 * lobe_bins + 5) return;
     int top = 0;
     for (int b = 1; b < nb; b++) if (P[b] > P[top]) top = b;
-    float rest[kHeartMaxBins]; int nn = 0;
+    int nn = 0;
     for (int b = 0; b < nb; b++)
-        if (b < top - kLobeBins || b > top + kLobeBins) rest[nn++] = P[b];
-    std::nth_element(rest, rest + nn / 2, rest + nn);
-    const double noise = rest[nn / 2] / 0.6931472;
+        if (b < top - lobe_bins || b > top + lobe_bins) s_rest[nn++] = P[b];
+    std::nth_element(s_rest, s_rest + nn / 2, s_rest + nn);
+    const double noise = s_rest[nn / 2] / 0.6931472;
     if (noise <= 0) return;
+    const float lobe_bpm = lobe_bins * bin_hz * 60.0f;
 
     struct Cand { float rate, snr; };
     FixedVec<Cand, 64> cand;
@@ -501,7 +539,7 @@ static void findPeaks(const float* P, int nb, float f0_hz, float thr_db,
         // Parabolic interpolation of the peak position between bins.
         const float den = P[b - 1] - 2.0f * P[b] + P[b + 1];
         const float d = den != 0 ? 0.5f * (P[b - 1] - P[b + 1]) / den : 0.0f;
-        cand.push_back({(f0_hz + (b + d) * kBinHz) * 60.0f, snr});
+        cand.push_back({(f0_hz + (b + d) * bin_hz) * 60.0f, snr});
     }
     std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.snr > b.snr; });
     for (const auto& c : cand) {
@@ -512,7 +550,7 @@ static void findPeaks(const float* P, int nb, float f0_hz, float thr_db,
             if (fabsf(c.rate - o.rate_bpm) < 3.0f || nearHarmonic(c.rate, o.rate_bpm, 2, 3, 1.5f)) ok = false;
             // Hann sidelobes: -31 dB at one lobe width, < -45 dB beyond two. A
             // much weaker neighbour inside two lobes is leakage, not a second rate.
-            if (fabsf(c.rate - o.rate_bpm) < 2.0f * kLobeBins && c.snr < o.snr - 25.0f) ok = false;
+            if (fabsf(c.rate - o.rate_bpm) < 2.0f * lobe_bpm && c.snr < o.snr - 25.0f) ok = false;
         }
         if (ok) out.push_back({c.rate, c.snr});
     }
@@ -528,13 +566,36 @@ LinkResult analyzeLink(const LinkSnapshot& s, const float* y) {
     const int nb = breathPeriodogram(y, s.n, P);
     // Every peak above the hypothesis SNR goes out with its SNR; consumers
     // decide what counts as a detection (snr >= breath_snr_db / heart_snr_db).
-    findPeaks(P, nb, g_dsp.breath_fmin_bpm / 60.0f, g_dsp.breath_hyp_db, nullptr, r.breaths);
+    findPeaks(P, nb, g_dsp.breath_fmin_bpm / 60.0f, kBinHz, kLobeBins, g_dsp.breath_hyp_db, nullptr, r.breaths);
     if (r.breaths.empty()) return r;
 
     // Heartbeat only on a still window that shows at least a breathing hypothesis.
     float H[kHeartMaxBins];
     const int nh = heartPeriodogram(y, s.n, H);
-    findPeaks(H, nh, g_dsp.heart_fmin_bpm / 60.0f, g_dsp.heart_hyp_db, &r.breaths, r.hearts);
+    findPeaks(H, nh, g_dsp.heart_fmin_bpm / 60.0f, kBinHz, kLobeBins, g_dsp.heart_hyp_db, &r.breaths, r.hearts);
+    return r;
+}
+
+// The long window is the 24 s analysis over more still history: the same PC1
+// (on the LONG_HZ grid) and Hann periodogram, with bins at max(30/T, 0.1) bpm
+// (half the 60/T resolution, so a line between bins loses < 0.4 dB; the floor
+// bounds the work at 600 s) and the main lobe +-120/T bpm excluded from the floor.
+LongResult analyzeLong(LongWork& w, int n_rows, int n_sel) {
+    LongResult r;
+    w.n_spec = 0;
+    if (n_rows < LONG_MIN_SEC * LONG_HZ || n_sel <= 0) return r;
+    auto row = [&](int i) -> const int16_t* { return w.rows[i]; };
+    const int n = principalComponent(row, n_rows, n_sel, (int)lrintf(g_dsp.hp_window_s * LONG_HZ * 0.5f), w.y);
+    const int m = n ? prep(w.y, n, 1, true, w.x, 16383.0f) : 0;
+    if (m == 0) return r;
+    r.window_s = (float)n / LONG_HZ;
+    const float bin_bpm = std::max(30.0f / r.window_s, 0.1f);
+    const int nb = std::min(LONG_SPEC_MAX, (int)((g_dsp.breath_fmax_bpm - g_dsp.breath_fmin_bpm) / bin_bpm) + 1);
+    const float f0 = g_dsp.breath_fmin_bpm / 60.0f, bin_hz = bin_bpm / 60.0f;
+    for (int b = 0; b < nb; b++) w.spectrum[b] = gpower(goertzel(w.x, m, f0 + b * bin_hz, (float)LONG_HZ));
+    w.n_spec = nb; w.spec_fmin_bpm = g_dsp.breath_fmin_bpm; w.spec_bin_bpm = bin_bpm;
+    const int lobe = std::max(2, (int)ceilf(120.0f / r.window_s / bin_bpm));
+    findPeaks(w.spectrum, nb, f0, bin_hz, lobe, g_dsp.breath_hyp_db, nullptr, r.breaths);
     return r;
 }
 
@@ -589,11 +650,32 @@ float link_quality_db(float rate_hz, float rssi_dbm) {
 // apart; leader<->follower is one reciprocal channel), so summing would let
 // two 11 dB noise peaks pass a 14 dB threshold. Comparing to the seed keeps a
 // cluster from drifting across rates one tolerance at a time.
-static void clusterInto(FixedVec<SpectralPeak, MAX_PEAKS * MAX_LINKS * 2>& all, float tol_bpm,
+// The valid links' peaks are visited in ascending rate (ties: link, then
+// index) in place: a merged copy of 2 x MAX_LINKS links' peaks would be KBs of
+// the main task's stack.
+template <class Get>
+static void clusterInto(const FixedVec<LinkResult, MAX_LINKS * 2>& links, Get peaks, float tol_bpm,
                         FixedVec<SpectralPeak, MAX_PEAKS>& out) {
-    std::sort(all.begin(), all.end(), [](const SpectralPeak& a, const SpectralPeak& b) { return a.rate_bpm < b.rate_bpm; });
+    struct Key { float rate; int link, idx; };
+    auto before = [](const Key& a, const Key& b) {
+        return a.rate != b.rate ? a.rate < b.rate : a.link != b.link ? a.link < b.link : a.idx < b.idx;
+    };
+    Key prev{-1e30f, -1, -1};
     float seed = 0, wsum = 0;
-    for (const auto& p : all) {
+    for (;;) {
+        bool found = false;
+        Key next{};
+        for (int li = 0; li < (int)links.size(); li++) {
+            if (!links[li].valid) continue;
+            const auto& v = peaks(links[li]);
+            for (int pi = 0; pi < (int)v.size(); pi++) {
+                const Key k{v[pi].rate_bpm, li, pi};
+                if (before(prev, k) && (!found || before(k, next))) { next = k; found = true; }
+            }
+        }
+        if (!found) return;
+        prev = next;
+        const SpectralPeak& p = peaks(links[next.link])[next.idx];
         const float wp = powf(10.0f, p.snr / 10.0f);
         if (!out.empty() && fabsf(p.rate_bpm - seed) <= tol_bpm) {
             SpectralPeak& k = out.back();
@@ -607,23 +689,26 @@ static void clusterInto(FixedVec<SpectralPeak, MAX_PEAKS * MAX_LINKS * 2>& all, 
     }
 }
 
+using Peaks = FixedVec<SpectralPeak, MAX_PEAKS>;
+
 SceneResult fuseLinks(const FixedVec<LinkResult, MAX_LINKS * 2>& links, float tol_bpm) {
     SceneResult scene;
-    FixedVec<SpectralPeak, MAX_PEAKS * MAX_LINKS * 2> breaths, hearts;
     for (const auto& l : links) {
         if (!l.valid) continue;
         scene.active_links++;
         if (l.motion_index > scene.motion_index) scene.motion_index = l.motion_index;
         if (l.motion) scene.presence = true;
-        for (const auto& b : l.breaths) breaths.push_back(b);
-        for (const auto& h : l.hearts) hearts.push_back(h);
+        scene.long_window_s = std::max(scene.long_window_s, l.long_window_s);
     }
-    clusterInto(breaths, tol_bpm, scene.breaths);
-    clusterInto(hearts, tol_bpm, scene.hearts);
+    clusterInto(links, [](const LinkResult& l) -> const Peaks& { return l.breaths; }, tol_bpm, scene.breaths);
+    clusterInto(links, [](const LinkResult& l) -> const Peaks& { return l.hearts; }, tol_bpm, scene.hearts);
+    clusterInto(links, [](const LinkResult& l) -> const Peaks& { return l.long_breaths; }, tol_bpm, scene.long_breaths);
     // Hypotheses stay in the lists (for the tracker); only detections count.
     // Presence here is gross motion only: breathing presence is decided by the
-    // tracker (confirmed tracks), which controls the false-alarm rate.
+    // tracker (confirmed tracks), which controls the false-alarm rate. Long-window
+    // peaks are counted separately and decide nothing.
     for (const auto& b : scene.breaths) scene.breather_count += b.snr >= g_dsp.breath_snr_db;
     for (const auto& h : scene.hearts) scene.heart_count += h.snr >= g_dsp.heart_snr_db;
+    for (const auto& b : scene.long_breaths) scene.long_count += b.snr >= g_dsp.long_snr_db;
     return scene;
 }

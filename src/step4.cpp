@@ -41,10 +41,6 @@ static volatile bool s_retune_pending = false;   // follower: leader's channel c
 static MsgChannelAgree s_agree = {};
 static volatile bool s_have_peer_survey = false;
 static MsgSurvey s_peer_survey = {};
-static LinkResult s_peer_links[MAX_LINKS];
-static uint8_t    s_peer_mac[MAX_LINKS][6];
-static uint8_t    s_peer_fmt[MAX_LINKS];
-static int64_t    s_peer_ts[MAX_LINKS] = {0};
 static Mode s_mode = DEFAULT_MODE;
 static VitalTracker s_tracker;
 
@@ -60,15 +56,8 @@ static void on_msg(MsgType t, const uint8_t* p, uint16_t len) {
         memcpy(&s_agree, p, sizeof(s_agree));
         s_agreed = true;
     }
-    else if (t == MsgType::FEATURE_REPORT && len >= sizeof(MsgFeature)) {
-        const MsgFeature* f = (const MsgFeature*)p;
-        if (f->link_id < MAX_LINKS) {
-            s_peer_links[f->link_id] = link_from_feature(*f);
-            memcpy(s_peer_mac[f->link_id], f->mac, 6);
-            s_peer_fmt[f->link_id] = f->fmt;
-            s_peer_ts[f->link_id] = esp_timer_get_time();
-        }
-    }
+    else if (t == MsgType::FEATURE_REPORT && len >= sizeof(MsgFeature))
+        peer_links_store(*(const MsgFeature*)p, esp_timer_get_time());
     else if (t == MsgType::RF_SOURCES && len >= offsetof(MsgRfSources, src))
         diag_set_peer_sources(*(const MsgRfSources*)p, len);
     else if (t == MsgType::ILLUM_SET && len >= sizeof(MsgIllumSet) && !election_is_leader())
@@ -150,6 +139,7 @@ void step4_main() {
     // panic, watchdog) is the case where the leader's CSI has re-latched.
     telem_comment("boot reset_reason=0x%02x", radio_reset_reason());
     election_init();
+    peer_links_init();   // before the UART task can deliver FEATURE_REPORTs
     link_init(on_msg);
 
     esp_err_t nvs_ret = nvs_flash_init();
@@ -246,17 +236,17 @@ void step4_main() {
     led_set(LedMode::SOLID);
 
     // --- main loop: fuse + report + serve ---
-    // ~3 KB with 6 links: static, off the 8 KB main stack (single main loop).
-    static LinkView views[MAX_LINKS];
-    static FixedVec<LinkResult, MAX_LINKS * 2> all;
+    // Per-link views and both boards' fusion candidates: PSRAM, off the main stack.
+    FusionWork& w = fusion_work();
     int tick = 0;
     int64_t recalib_until = 0;
     TickType_t wake = xTaskGetTickCount();
     for (;;) {
         if (s_promote_pending) { s_promote_pending = false; bring_up_ap(); }
         if (sensing_take_csi_restart()) {
-            telem_comment("csi frozen (identical frames): recovering, restarts=%u heap=%u min=%u",
-                          (unsigned)radio_csi_restarts(), (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
+            telem_comment("csi frozen (identical frames): recovering, restarts=%u heap_int=%u min=%u",
+                          (unsigned)radio_csi_restarts(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
             vTaskDelay(pdMS_TO_TICKS(20));   // let the line out before a possible deep sleep
             radio_recover_csi();
         }
@@ -281,55 +271,57 @@ void step4_main() {
         if (recalib_until && esp_timer_get_time() > recalib_until) { sensing_finalize_calibration(); recalib_until = 0; led_set(LedMode::SOLID); telem_comment("recalibration done"); }
 
         const int64_t tick_t0 = esp_timer_get_time();
-        int n = sensing_snapshot(views, MAX_LINKS);
-        all.clear();
+        int n = sensing_snapshot(w.views, MAX_LINKS);
+        w.all.clear();
         bool emit_feat = (tick % 2) == 0;
         // Fusion candidates: every link on both boards, keyed by transmitter,
-        // PHY format and receiving board.
-        static LinkResult cand_r[MAX_LINKS * 2];
-        static LinkInput  cand_in[MAX_LINKS * 2];
+        // PHY format and receiving board. This board's come first (index = view).
         int nc = 0;
         auto add = [&](const LinkResult& r, const uint8_t* mac, uint8_t fmt, bool peer) {
-            LinkInput& in = cand_in[nc];
+            LinkInput& in = w.cand_in[nc];
             memcpy(in.key.mac, mac, 6); in.key.fmt = fmt; in.key.peer = peer ? 1 : 0;
             in.quality_db = link_quality_db(r.pkt_rate, r.rssi);
             in.valid = r.valid;
-            cand_r[nc++] = r;
+            w.cand_r[nc++] = r;
         };
         for (int i = 0; i < n; i++) {
-            add(views[i].result, views[i].mac, views[i].fmt, false);
-            if (emit_feat) telem_feat(views[i].mac, views[i].result);
+            const LinkView& v = w.views[i];
+            add(v.result, v.mac, v.fmt, false);
+            if (emit_feat) telem_feat(v.mac, v.result);
             if (!election_is_leader()) {
-                MsgFeature f = feature_from_link((uint8_t)i, views[i].mac, views[i].fmt, views[i].result);
+                MsgFeature f = feature_from_link((uint8_t)i, v.mac, v.fmt, v.result);
                 link_send(MsgType::FEATURE_REPORT, &f, sizeof(f));
             }
         }
         if (election_is_leader()) {
-            int64_t now = esp_timer_get_time();
+            const int64_t now = esp_timer_get_time();
+            const PeerLink* peers = peer_links();
             for (int i = 0; i < MAX_LINKS; i++)
-                if (s_peer_ts[i] && now - s_peer_ts[i] < 2000000) add(s_peer_links[i], s_peer_mac[i], s_peer_fmt[i], true);
+                if (peers[i].ts_us && now - peers[i].ts_us < 2000000) add(peers[i].r, peers[i].mac, peers[i].fmt, true);
         }
         // Which links feed the scene, chosen per receiving board: the best
         // "links per board" (tune tab, 1..MAX_LINKS, same cap for both boards)
         // by link_quality_db (RSSI + frame-rate gain), smoothed over 5 s, held
         // for at least 20 s, replaced only by a link 3 dB better for 5 s straight.
+        // Every admitted link is still analysed and reported; this only picks
+        // which ones the scene fuses.
         static LinkSelector<MAX_LINKS + 4> s_select[2];   // [0] this board, [1] the peer
-        bool sel[MAX_LINKS * 2] = {};
+        for (int i = 0; i < nc; i++) w.sel[i] = false;
         for (int b = 0; b < 2; b++) {
             LinkInput in[MAX_LINKS * 2]; int idx[MAX_LINKS * 2]; int m = 0;
-            for (int i = 0; i < nc; i++) if (cand_in[i].key.peer == b) { idx[m] = i; in[m++] = cand_in[i]; }
+            for (int i = 0; i < nc; i++) if (w.cand_in[i].key.peer == b) { idx[m] = i; in[m++] = w.cand_in[i]; }
             bool s[MAX_LINKS * 2];
             s_select[b].update(1.0f / TELEM_SCENE_HZ, in, m, (int)g_dsp.links_per_board, s);
-            for (int k = 0; k < m; k++) sel[idx[k]] = s[k];
+            for (int k = 0; k < m; k++) w.sel[idx[k]] = s[k];
         }
-        UsedLink used[MAX_LINKS * 2]; int nused = 0;
+        int nused = 0;
         for (int i = 0; i < nc; i++) {
-            if (!sel[i]) continue;
-            all.push_back(cand_r[i]);
-            memcpy(used[nused].mac, cand_in[i].key.mac, 6); used[nused].peer = cand_in[i].key.peer; nused++;
+            if (!w.sel[i]) continue;
+            w.all.push_back(w.cand_r[i]);
+            memcpy(w.used[nused].mac, w.cand_in[i].key.mac, 6); w.used[nused].peer = w.cand_in[i].key.peer; nused++;
         }
-        used_links_set(used, nused);
-        SceneResult scene = fuseLinks(all);
+        used_links_set(w.used, nused);
+        SceneResult scene = fuseLinks(w.all);
 
         // --- tracker + web scene (leader serves it) ---
         // Presence and counts come from confirmed tracks: a per-tick detection is
@@ -364,10 +356,21 @@ void step4_main() {
             ws.wave_point = sensing_wave_point(&ws.wave_valid);
             ws.hspectrum = sensing_heart_spectrum();
             ws.hspectrum_fmin_bpm = g_dsp.heart_fmin_bpm;
+            ws.long_window_s = scene.long_window_s;
+            ws.long_detect_db = g_dsp.long_snr_db;
+            ws.long_breaths = scene.long_breaths;
+            const LongSpectrum ls = sensing_long_spectrum();
+            ws.lspectrum.clear();
+            for (int i = 0; i < ls.n; i++) ws.lspectrum.push_back(ls.p[i]);
+            ws.lspec_fmin_bpm = ls.fmin_bpm; ws.lspec_bin_bpm = ls.bin_bpm; ws.lspec_window_s = ls.window_s;
             ws.rf.clear();
             for (int i = 0; i < n; i++) {
-                WebRf rf; char m[13], fl[8]; hexmac(views[i].mac, m);
-                rf.set_label(m, radio_format_label(views[i].fmt, fl)); rf.coupling = views[i].result.mean_amp; rf.rssi = views[i].result.rssi;
+                const LinkView& v = w.views[i];
+                WebRf rf; char m[13], fl[8]; hexmac(v.mac, m);
+                rf.set_label(m, radio_format_label(v.fmt, fl)); rf.coupling = v.result.mean_amp; rf.rssi = v.result.rssi;
+                rf.used = w.sel[i];
+                for (const auto& p : v.result.long_breaths)
+                    if (p.snr > rf.long_snr) { rf.long_snr = p.snr; rf.long_bpm = p.rate_bpm; }
                 ws.rf.push_back(rf);
             }
             scene_state_end();

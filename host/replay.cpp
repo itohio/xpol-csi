@@ -3,12 +3,17 @@
 // firmware main loop.
 //
 //   c++ -std=c++17 -O2 -I../src replay.cpp ../src/dsp.cpp -o /tmp/replay
-//   /tmp/replay data/present-1101-*.log [--thr <mac>=<variance>]... [--param "<tune name>=<value>"]... [--spectrum]
+//   /tmp/replay data/present-1101-*.log [--thr <mac>=<variance>]... [--param "<tune name>=<value>"]... [--spectrum] [--long]
 //
 // Output (stdout), one row per link per tick:
 //   T,t_s,mac,rate,motion_index,motion,motion_var,idle_s,n,breaths(bpm:dB;..),hearts
 // with --spectrum also, for still links:
 //   S,t_s,mac,fmin_bpm,p0 p1 ...   (breathing band, 1 bin per bpm)
+// with --long, each link's long-window analysis on the firmware's schedule
+// (every max(2 s, window / 30) while still; "long window" is a --param):
+//   L,t_s,mac,window_s,bin_bpm,breaths(bpm:dB;..)
+// and with --spectrum too:
+//   LS,t_s,mac,fmin_bpm,bin_bpm,p0 p1 ...
 // --thr sets a link's calibrated motion threshold (moving variance, as printed by
 // the firmware's "# calibrated <mac> motion_threshold=..." line).
 #include "dsp.h"
@@ -21,11 +26,12 @@
 static int hexval(char c) { return c <= '9' ? c - '0' : c - 'a' + 10; }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { fprintf(stderr, "usage: replay <session.log> [--thr mac=var]... [--spectrum]\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: replay <session.log> [--thr mac=var]... [--param name=value]... [--spectrum] [--long]\n"); return 2; }
     std::map<std::string, double> thr;
-    bool spectrum = false;
+    bool spectrum = false, long_window = false;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--spectrum")) spectrum = true;
+        else if (!strcmp(argv[i], "--long")) long_window = true;
         else if (!strcmp(argv[i], "--thr") && i + 1 < argc) {
             const char* eq = strchr(argv[++i], '=');
             if (eq) thr[std::string(argv[i], eq - argv[i])] = atof(eq + 1);
@@ -41,7 +47,9 @@ int main(int argc, char** argv) {
     if (!fp) { perror(argv[1]); return 1; }
 
     std::map<std::string, LinkProcessor*> links;
+    std::map<std::string, int64_t> long_due;
     static float y[DSP_BREATH_LEN];
+    static LongWork work;
     static char line[4096];
     int64_t base = -1, last_raw = -1, wrap = 0, next_tick = -1;
     long frames = 0;
@@ -87,6 +95,22 @@ int main(int argc, char** argv) {
                     auto sp = breathSpectrum(y, s.n);
                     printf("S,%.2f,%s,%.1f,", ts, m.c_str(), g_dsp.breath_fmin_bpm);
                     for (size_t i = 0; i < sp.size(); i++) printf(i ? " %.4g" : "%.4g", sp[i]);
+                    printf("\n");
+                }
+            }
+            for (auto& [m, proc] : links) {
+                if (!long_window || next_tick < long_due[m]) continue;
+                const int n = proc->stillLongRows(next_tick, work.rows, (int)(g_dsp.long_window_s * LONG_HZ));
+                const LongResult r = analyzeLong(work, n, proc->nSel());
+                long_due[m] = next_tick + (int64_t)(std::max(2.0f, r.window_s / 30.0f) * 1e6f);
+                if (r.window_s == 0) continue;
+                std::string b;
+                char tmp[32];
+                for (auto& x : r.breaths) { snprintf(tmp, sizeof tmp, "%s%.2f:%.1f", b.empty() ? "" : ";", x.rate_bpm, x.snr); b += tmp; }
+                printf("L,%.2f,%s,%.1f,%.3f,%s\n", (next_tick - base) / 1e6, m.c_str(), r.window_s, work.spec_bin_bpm, b.c_str());
+                if (spectrum) {
+                    printf("LS,%.2f,%s,%.1f,%.3f,", (next_tick - base) / 1e6, m.c_str(), work.spec_fmin_bpm, work.spec_bin_bpm);
+                    for (int i = 0; i < work.n_spec; i++) printf(i ? " %.4g" : "%.4g", work.spectrum[i]);
                     printf("\n");
                 }
             }

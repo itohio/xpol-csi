@@ -28,8 +28,18 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 
 # Main task stack: wifi/netif/http setup, then the sensing loop (per-link spectral
-# analysis + fusion of up to 2*MAX_LINKS link results). 8 KB overflowed at 6 links.
+# analysis + fusion). Per-link results live in PSRAM (FusionWork); 8 KB overflowed at 6 links.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+
+# 8 MB PSRAM (XIAO ESP32-C5) for the link histories only: added to the
+# capability allocator, so malloc(), task stacks, the Wi-Fi driver, lwIP and the
+# CSI ring stay in internal SRAM, and only explicit MALLOC_CAP_SPIRAM
+# allocations (src/psram.h) move out. No .bss in PSRAM: that would also move the
+# Wi-Fi libraries' state (frozen-CSI work assumes it internal).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
 # Compiler
 CONFIG_COMPILER_OPTIMIZATION_PERF=y

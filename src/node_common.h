@@ -1,7 +1,10 @@
 #pragma once
-// Shared helpers: feature (de)serialization and survey->plan.
+// Shared helpers: feature (de)serialization, the peer's link results, the
+// per-tick fusion scratch, and survey->plan.
 
 #include "link_proto.h"
+#include "link_select.h"
+#include "sensing.h"
 #include "dsp.h"
 #include <stdint.h>
 
@@ -11,11 +14,31 @@ void app_run();
 MsgFeature feature_from_link(uint8_t link_id, const uint8_t* mac, uint8_t fmt, const LinkResult& r);
 LinkResult link_from_feature(const MsgFeature& m);
 
+// Leader: the peer's latest per-link results (FEATURE_REPORT), by its link
+// index, in PSRAM. Call peer_links_init() before link_init(): the UART task
+// stores, the main task reads.
+struct PeerLink { LinkResult r; uint8_t mac[6]; uint8_t fmt; int64_t ts_us; };
+void      peer_links_init();
+void      peer_links_store(const MsgFeature& f, int64_t now_us);
+PeerLink* peer_links();   // MAX_LINKS entries
+
 // Leader: the links whose CSI fed the scene on the last tick (chosen by the
 // link selector, see link_select.h), by transmitter MAC and receiving board.
 struct UsedLink { uint8_t mac[6]; bool peer; };
 void used_links_set(const UsedLink* u, int n);
 bool used_link(const uint8_t* mac, bool peer);
+
+// Per-tick fusion scratch of the main task (PSRAM, ~25 KB at 16 links): this
+// board's link views and the fusion candidates of both boards.
+struct FusionWork {
+    LinkView   views[MAX_LINKS];
+    LinkResult cand_r[2 * MAX_LINKS];
+    LinkInput  cand_in[2 * MAX_LINKS];
+    bool       sel[2 * MAX_LINKS];
+    UsedLink   used[2 * MAX_LINKS];
+    FixedVec<LinkResult, 2 * MAX_LINKS> all;
+};
+FusionWork& fusion_work();   // allocated on the first call (main task)
 
 // This node's RF source table as a UART message. Returns the bytes to send
 // (header + n entries).

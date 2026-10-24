@@ -57,6 +57,7 @@ void telem_header(const uint8_t self_mac[6], bool band_5g) {
     telem_comment("schema CSI,t_ms,src_mac,rssi,noise,nsub,amp0 amp1 ...");
     telem_comment("schema IQ,t_us,src_mac,rssi,noise,gain_q8,nsub,fmt,hex(int8 I0 Q0 I1 Q1 ...)   (raw dump, 'r'; fmt = PHY format id, radio.h)");
     telem_comment("schema FEAT,t_ms,src_mac,valid,motion,is_motion,rate,nb,bpm:snr;..,nh,bpm:snr;..");
+    telem_comment("schema LONG,t_ms,src_mac,window_s,nb,bpm:snr;..   (long-window breathing; evidence only)");
     telem_comment("schema SCENE,t_ms,presence,motion,links,nb,bpm:snr;..,nh,bpm:snr;..");
 }
 
@@ -134,6 +135,16 @@ void telem_feat(const uint8_t src_mac[6], const LinkResult& r) {
              (unsigned long)now_ms(), mac, r.valid ? 1 : 0, r.motion_index,
              r.motion ? 1 : 0, r.pkt_rate,
              (int)r.breaths.size(), bs, (int)r.hearts.size(), hs);
+    emit(line);
+}
+
+void telem_long(const uint8_t src_mac[6], const LongResult& r) {
+    char mac[13]; mac_hex(src_mac, mac);
+    char bs[160];
+    peaks_str(bs, sizeof(bs), r.breaths);
+    char line[220];
+    snprintf(line, sizeof(line), "LONG,%lu,%s,%.0f,%d,%s\n",
+             (unsigned long)now_ms(), mac, r.window_s, (int)r.breaths.size(), bs);
     emit(line);
 }
 

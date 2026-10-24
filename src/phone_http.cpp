@@ -62,8 +62,10 @@ static FILE* open_asset(const char* fullpath, bool* gz) {
 // delivering it until the radio was powered down. Below kHeapFloor the server
 // refuses requests (503, retry) and pauses graph frames instead.
 static constexpr uint32_t kHeapFloor = 12 * 1024;
+// Internal SRAM only: the Wi-Fi driver and lwIP allocate there, PSRAM does not help them.
+static uint32_t internal_free() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL); }
 static bool heap_low(httpd_req_t* req) {
-    if (esp_get_free_heap_size() >= kHeapFloor) return false;
+    if (internal_free() >= kHeapFloor) return false;
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_hdr(req, "Retry-After", "1");
     httpd_resp_send(req, nullptr, 0);
@@ -102,7 +104,7 @@ static esp_err_t static_get(httpd_req_t* req) {
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
         // Each chunk sits in TCP buffers (heap) until acknowledged: let the
         // heap recover before queueing more, rather than starve the Wi-Fi driver.
-        for (int w = 0; w < 200 && esp_get_free_heap_size() < kHeapFloor; w++) vTaskDelay(pdMS_TO_TICKS(10));
+        for (int w = 0; w < 200 && internal_free() < kHeapFloor; w++) vTaskDelay(pdMS_TO_TICKS(10));
         if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) { fclose(f); return ESP_FAIL; }
     }
     fclose(f);
@@ -210,17 +212,18 @@ struct Out {
     void u32(uint32_t v) { put(&v, 4); }
 };
 
-// STATUS (0xC0), 40 B: u8 type, u8 channel, u8 links_per_board, u8 reserved,
-// then two boards (this one = leader, then the peer), 18 B each:
-//   u8 present, u8 cpu_busy %, u32 heap_free, u32 heap_min (last 2 s),
-//   i8 tx_q (0.25 dBm), u16 illum_hz, u16 csi_fps, u16 csi_restarts, u8 frozen.
+// STATUS (0xC0), 48 B: u8 type, u8 channel, u8 links_per_board, u8 max_links,
+// then two boards (this one = leader, then the peer), 22 B each:
+//   u8 present, u8 cpu_busy %, u32 heap_free, u32 heap_min (last 2 s; internal
+//   RAM), u32 psram_free, i8 tx_q (0.25 dBm), u16 illum_hz, u16 csi_fps,
+//   u16 csi_restarts, u8 frozen.
 int encode_status(uint8_t* buf, int cap) {
     Out o{buf, cap};
     uint8_t primary = 0; wifi_second_chan_t second;
     esp_wifi_get_channel(&primary, &second);
-    o.u8(0xC0); o.u8(primary); o.u8((uint8_t)g_dsp.links_per_board); o.u8(0);
+    o.u8(0xC0); o.u8(primary); o.u8((uint8_t)g_dsp.links_per_board); o.u8(MAX_LINKS);
     auto board = [&](bool present, const BoardStatus& b) {
-        o.u8(present ? 1 : 0); o.u8(b.cpu_busy); o.u32(b.heap_free); o.u32(b.heap_min);
+        o.u8(present ? 1 : 0); o.u8(b.cpu_busy); o.u32(b.heap_free); o.u32(b.heap_min); o.u32(b.psram_free);
         o.u8((uint8_t)b.tx_q); o.u16(b.illum_hz); o.u16(b.csi_fps); o.u16(b.csi_restarts); o.u8(b.frozen);
     };
     board(true, diag_board_status());
@@ -315,10 +318,11 @@ int encode_radio(uint8_t* buf, int cap) {
 // want it, and only if one of them does. Below kHeapFloor only STATUS and
 // SCENE (small) go out.
 static void ws_broadcast_task(void*) {
-    constexpr int kSpectra = 1 + 5 + SPEC_MAX + 5 + HSPEC_MAX + 5;
-    static uint8_t status_buf[48], scene_buf[512], spectra_buf[kSpectra],
+    constexpr int kSpectra = 1 + 5 + SPEC_MAX + 5 + HSPEC_MAX + 5 + 14 + LONG_SPEC_MAX;
+    static uint8_t status_buf[48], scene_buf[1024], spectra_buf[kSpectra],
                    raw_buf[8 + kRawRows * DSP_NSEL * 2], radio_buf[1280];
-    static_assert(12 + TRACK_MAX * 39 + 1 + MAX_LINKS * 30 <= sizeof(scene_buf), "scene message does not fit");
+    static_assert(12 + TRACK_MAX * 39 + 1 + MAX_LINKS * (1 + sizeof(WebRf::mac) + 15) + 9 + MAX_PEAKS * 8 <= sizeof(scene_buf),
+                  "scene message does not fit");
     int raw_slot = -1; uint32_t raw_cursor = 0;
     int fds[WS_MAX_CLIENTS];
     for (uint32_t tick = 0;; tick++) {
@@ -326,7 +330,7 @@ static void ws_broadcast_task(void*) {
         size_t cnt = WS_MAX_CLIENTS;
         if (httpd_get_client_list(s_srv, &cnt, fds) != ESP_OK) continue;
         const bool slow = tick % 4 == 0;   // 1 Hz messages
-        const bool roomy = esp_get_free_heap_size() >= kHeapFloor;
+        const bool roomy = internal_free() >= kHeapFloor;
         int st_n = -1, sc_n = -1, sp_n = -1, raw_n = -1, rad_n = -1;
         for (size_t i = 0; i < cnt; i++) {
             if (httpd_ws_get_fd_info(s_srv, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) continue;
@@ -379,6 +383,6 @@ void phone_http_start() {
     httpd_register_uri_handler(s_srv, &prm);
     httpd_register_uri_handler(s_srv, &all);
     if (xTaskCreate(ws_broadcast_task, "ws_tx", 4096, nullptr, 5, nullptr) != pdPASS)
-        ESP_LOGE(TAG, "ws_tx task create failed (heap free=%u)", (unsigned)esp_get_free_heap_size());
+        ESP_LOGE(TAG, "ws_tx task create failed (internal free=%u)", (unsigned)internal_free());
     ESP_LOGI(TAG, "http+ws gateway ready");
 }

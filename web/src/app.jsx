@@ -40,7 +40,7 @@ function handle(m) {
     }
     case 'spectra':
       if (m.wave == null) wave = []; else push(wave, m.wave, WAVE);   // no still window: the curve restarts
-      spectra.value = { spectrum: m.spectrum, hspectrum: m.hspectrum, wave: wave.slice() };
+      spectra.value = { spectrum: m.spectrum, hspectrum: m.hspectrum, lspectrum: m.lspectrum, wave: wave.slice() };
       break;
     case 'raw': {
       const key = `${m.slot}/${m.sub}`;
@@ -111,19 +111,22 @@ function Chart({ series, height = 70, ymin, ymax, zero = false, labels }) {
 // uses), 0..20 dB, so a real line stands out as a steady vertical trace and
 // sidelobes/noise stay dark. Newest row at the bottom.
 const WF_ROWS = 480;   // 2 min at 4 Hz
+const AXIS_STEPS = [0.5, 1, 2, 5, 10, 15, 20, 30, 50, 100];   // bpm between axis labels
 function wfColor(db) {
   const t = Math.max(0, Math.min(1, db / 20));
   return [Math.round(255 * Math.min(1, t * 1.6)), Math.round(255 * Math.max(0, t * 1.6 - 0.6)), Math.round(80 * (1 - t))];
 }
 function Spectrum({ spec }) {
   const ref = useRef(null);
-  const hist = useRef({ last: null, rows: [] });
+  const hist = useRef({ last: null, key: '', rows: [] });
   const mode = useRef('bars');
   useEffect(() => {
     const c = ref.current; if (!c || !spec || !spec.p || !spec.p.length) return;
     const H = hist.current;
     if (spec !== H.last) {                       // one row per scene update
       H.last = spec;
+      const key = `${spec.p.length}/${spec.df}/${spec.fmin}`;
+      if (key !== H.key) { H.key = key; H.rows = []; }   // new bin layout: rows must not mix
       const p = spec.p, s = [...p].sort((a, b) => a - b), med = s[s.length >> 1] || 1e-9;
       H.rows.push(Float32Array.from(p, (v) => 10 * Math.log10(v / med)));
       if (H.rows.length > WF_ROWS) H.rows.shift();
@@ -137,7 +140,7 @@ function Spectrum({ spec }) {
       for (let i = 0; i < n; i++) {
         const bh = (p[i] / mx) * (h - 16);
         g.fillStyle = `hsl(${200 - 160 * (p[i] / mx)},70%,55%)`;
-        g.fillRect(i * bw, h - 14 - bh, bw - 1, bh);
+        g.fillRect(i * bw, h - 14 - bh, bw > 3 ? bw - 1 : bw, bh);   // no gaps when bins are sub-pixel
       }
     } else {
       const rows = H.rows, img = new ImageData(n, rows.length);
@@ -152,7 +155,12 @@ function Spectrum({ spec }) {
       g.drawImage(off, 0, h - 14 - ph, w, ph);
     }
     g.fillStyle = '#8b949e'; g.font = '10px system-ui';
-    for (let b = 0; b <= n; b += n > 60 ? 15 : 6) g.fillText(Math.round(spec.fmin + b) + '', b * bw, h - 2);
+    const span = n * spec.df, labels = Math.max(3, Math.min(10, w / 45));
+    const step = AXIS_STEPS.find((s) => span / s <= labels) ?? AXIS_STEPS[AXIS_STEPS.length - 1];
+    for (let v = Math.ceil(spec.fmin / step - 1e-6) * step; v <= spec.fmin + span + 1e-6; v += step) {
+      const x = ((v - spec.fmin) / spec.df) * bw;
+      if (x <= w - 12) g.fillText(step < 1 ? v.toFixed(1) : Math.round(v) + '', x, h - 2);
+    }
   });
   const toggle = () => { mode.current = mode.current === 'bars' ? 'waterfall' : 'bars'; scene.value = { ...scene.value }; };   // re-render now
   return <canvas ref={ref} onClick={toggle} title="click: bars / waterfall" style={{ width: '100%', height: '110px', cursor: 'pointer' }} />;
@@ -257,6 +265,8 @@ function Overview() {
         {!br.length && <div class="muted">no hypotheses: vitals are evaluated after being still for a while (tune: "still before vitals")</div>}
       </div>
 
+      <LongWindowCard long={s?.long} />
+
       <RfPanel rf={s?.rf} />
     </>
   );
@@ -281,16 +291,43 @@ function RssiBar({ last, avg, used = false }) {
   );
 }
 
+// Long-window (minutes of still history) breathing peaks: evidence only; presence
+// and breather counts still come from the 24 s tracker.
+function LongWindowCard({ long }) {
+  if (!long) return null;
+  return (
+    <div class="card">
+      <div class="row">
+        <span>long-window breathing</span>
+        {long.window_s > 0
+          ? <span class="muted">{long.window_s.toFixed(0)} s still history</span>
+          : <span class="muted">needs ≥ 48 s of stillness</span>}
+      </div>
+      {long.peaks.map((p) => (
+        <div class="brow" key={p.bpm}>
+          <span class={'tag ' + (p.snr >= long.detect_db ? 'ok' : 'maybe')}>{p.snr >= long.detect_db ? 'long ✓' : 'hypothesis'}</span>
+          <span>{p.bpm.toFixed(1)} bpm</span>
+          <span class="muted">{p.snr.toFixed(1)} dB</span>
+        </div>
+      ))}
+      {long.window_s > 0 && !long.peaks.length && <div class="muted">no long-window peaks</div>}
+      <div class="muted">evidence only (detect ≥ {long.detect_db.toFixed(1)} dB): presence and breather counts come from the 24 s tracker</div>
+    </div>
+  );
+}
+
 function RfPanel({ rf }) {
   if (!rf || !rf.length) return null;
   return (
     <div class="card">
-      <div class="row"><span>RF links (RSSI)</span><span class="muted">|H| = AGC-normalised CSI amplitude</span></div>
+      <div class="row"><span>sensing links ({rf.length})</span><span class="muted">|H| = AGC-normalised CSI amplitude</span></div>
       {rf.map((r) => (
         <div class="brow" key={r.mac}>
           <span class="muted mono">{r.mac}</span>
-          <RssiBar last={r.rssi} />
+          {r.scene && <span class="tag ok" title="its CSI feeds the scene">scene</span>}
+          <RssiBar last={r.rssi} used={r.scene} />
           <span class="muted">|H| {r.coupling.toFixed(1)}</span>
+          {r.long_bpm > 0 && <span class="muted">long {r.long_bpm.toFixed(1)} bpm · {r.long_snr.toFixed(0)} dB</span>}
         </div>
       ))}
     </div>
@@ -309,6 +346,13 @@ function Graphs() {
       <div class="card">
         <div class="row"><span>breathing spectrum (raw filter, bpm)</span><span class="muted">click for waterfall</span></div>
         <Spectrum spec={sp?.spectrum} />
+      </div>
+      <div class="card">
+        <div class="row">
+          <span>long-window spectrum (strongest still link)</span>
+          <span class="muted">{sp?.lspectrum ? `${sp.lspectrum.window_s.toFixed(0)} s, ${+sp.lspectrum.df.toFixed(2)} bpm bins` : 'evidence only'}</span>
+        </div>
+        {sp?.lspectrum ? <Spectrum spec={sp.lspectrum} /> : <div class="muted">no long window yet: needs ≥ 48 s of stillness</div>}
       </div>
       <div class="card">
         <div class="row"><span>heart-band spectrum (same series, 45–150 bpm)</span><span class="muted">experimental</span></div>
@@ -663,7 +707,7 @@ function Radio() {
         <div class="row"><span>CSI frames</span><span>{fmt(r.csi_rate)} /s</span></div>
         <div class="row"><span>drops</span><span class={r.drop_rate > 0 ? 'warn' : ''}>{r.csi_drops} total · {fmt(r.drop_rate)} /s</span></div>
         <div class="row"><span>backlog peak</span><span>{r.backlog_peak} frames</span></div>
-        <div class="row"><span>heap free / min</span><span>{kb(r.heap_free)} / {kb(r.heap_min)} KB</span></div>
+        <div class="row"><span>internal RAM free / min</span><span>{kb(r.heap_free)} / {kb(r.heap_min)} KB</span></div>
         <div class="row"><span>main loop</span><span>{r.loop_ms} ms <span class="muted">/ 250 ms</span></span></div>
       </div>
     </>
@@ -672,15 +716,16 @@ function Radio() {
 
 const PAGES = { overview: Overview, graphs: Graphs, raw: Raw, tune: Tune, radio: Radio };
 
-// Always visible, one line: each board's CPU, free heap (and its lowest point
-// over the last 2 s: the Wi-Fi driver needs headroom), TX power, illumination
-// and CSI rate; red when its CSI is frozen.
+// Always visible, one line: each board's CPU, free internal RAM (and its lowest
+// point over the last 2 s: the Wi-Fi driver needs headroom), free PSRAM, TX power,
+// illumination and CSI rate; red when its CSI is frozen.
 function BoardStat({ name, b }) {
   if (!b) return <span class="st muted">{name} —</span>;
   return (
     <span class={'st' + (b.frozen ? ' bad' : '')}
-          title={`${name}: CPU busy, free heap now (lowest in the last 2 s), max TX power, illumination rate, CSI frames/s`}>
+          title={`${name}: CPU busy, free internal RAM now (lowest in the last 2 s), free PSRAM, max TX power, illumination rate, CSI frames/s`}>
       <b>{name}</b> {b.cpu}% · {kb(b.heap_free)}K<span class={b.heap_min < 12 * 1024 ? ' warn' : ' muted'}>↓{kb(b.heap_min)}</span>
+      {b.psram_free > 0 && <span class="muted"> · PSRAM {(b.psram_free / 1048576).toFixed(1)}M</span>}
       {' '}· {b.tx == null ? '?' : b.tx} dBm · {b.illum_hz ? `${b.illum_hz} Hz` : 'tx off'} · {b.csi_fps} fr/s
       {b.frozen && <span> · CSI FROZEN</span>}
       {b.csi_restarts > 0 && <span class="muted"> · {b.csi_restarts} restarts</span>}
@@ -692,7 +737,7 @@ function StatusBar() {
   return (
     <div class="statusbar">
       <span class={connected.value ? 'muted' : 'warn'}>{transport.value}</span>
-      {st && <span class="muted">ch {st.channel} · {st.links_per_board} link{st.links_per_board > 1 ? 's' : ''}/board</span>}
+      {st && <span class="muted">ch {st.channel} · {st.links_per_board}/{st.max_links} links/board</span>}
       <BoardStat name="L" b={st?.leader} />
       <BoardStat name="F" b={st?.follower} />
     </div>

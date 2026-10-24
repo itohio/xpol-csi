@@ -73,11 +73,38 @@
 #define HSPEC_MAX 128  // heart-band spectrum bins (45..150 bpm = 106)
 #endif
 #ifndef MAX_LINKS
-#define MAX_LINKS 3
+#define MAX_LINKS 16
+#endif
+#ifndef LINKS_PER_BOARD
+#define LINKS_PER_BOARD 3
 #endif
 
 // Samples in the breathing window (DSP_DECIM_HZ grid).
 #define DSP_BREATH_LEN (BREATH_WIN_SEC * DSP_DECIM_HZ)
+
+// Long history: every link also keeps LONG_HIST_SEC of its selected
+// subcarriers at LONG_HZ (block means of the breathing grid; the breathing band
+// ends at 0.7 Hz). A still window of up to "long window" seconds of it is
+// analysed like the 24 s window, with finer frequency bins. ~96 KB per link:
+// PSRAM on the device.
+#ifndef LONG_HZ
+#define LONG_HZ 5
+#endif
+#ifndef LONG_HIST_SEC
+#define LONG_HIST_SEC 600
+#endif
+#ifndef LONG_WIN_SEC
+#define LONG_WIN_SEC 120         // default "long window"
+#endif
+#ifndef LONG_MIN_SEC
+#define LONG_MIN_SEC 48          // shortest still window analysed (two 24 s windows)
+#endif
+#ifndef LONG_SNR_DB
+#define LONG_SNR_DB 14.0f        // default "long SNR (detect)"
+#endif
+#define DSP_LONG_LEN (LONG_HIST_SEC * LONG_HZ)
+#define LONG_SPEC_MAX 480        // bins: band width (<= SPEC_MAX - 1 bpm) / 0.1 bpm + 1
+static_assert(DSP_DECIM_HZ % LONG_HZ == 0, "the long grid must decimate the breathing grid");
 
 // One CSI reading, read in place from the radio's ring: raw int8 I/Q, no
 // per-frame float conversion. Only the selected subcarriers' amplitudes are
@@ -137,8 +164,10 @@ struct DspParams {
     float breath_fmax_bpm = BREATH_FMAX_HZ * 60.0f;
     float heart_fmin_bpm  = HEART_FMIN_HZ * 60.0f;
     float heart_fmax_bpm  = HEART_FMAX_HZ * 60.0f;
-    float links_per_board = MAX_LINKS;   // links of each board that may feed the scene (1..MAX_LINKS)
+    float links_per_board = LINKS_PER_BOARD;   // links of each board that may feed the scene (1..MAX_LINKS)
     float hp_window_s     = 8.0f;    // low cut: each subcarrier minus its centered moving average over this (0 = off)
+    float long_window_s   = LONG_WIN_SEC;   // still history analysed by analyzeLong (LONG_MIN_SEC..LONG_HIST_SEC)
+    float long_snr_db     = LONG_SNR_DB;    // a long-window peak at this SNR counts as a long-window detection
     // derived
     int32_t  hampel_x1e4  = 44478;   // hampel_k * 1.4826 * 1e4
     uint32_t thr_scale_q8 = 256;
@@ -174,6 +203,26 @@ struct LinkResult {
     float   mean_amp = 0;      // mean CSI amplitude (direct-path coupling proxy, for RF alignment)
     FixedVec<SpectralPeak, MAX_PEAKS> breaths;   // hypotheses, snr >= breath_hyp_db
     FixedVec<SpectralPeak, MAX_PEAKS> hearts;    // hypotheses, snr >= heart_hyp_db
+    float   long_window_s = 0;                   // still history behind long_breaths (0: none)
+    FixedVec<SpectralPeak, MAX_PEAKS> long_breaths;   // long-window hypotheses, snr >= breath_hyp_db
+};
+
+// Long-window breathing of one link (analyzeLong).
+struct LongResult {
+    float window_s = 0;                          // still history analysed (0: not enough yet)
+    FixedVec<SpectralPeak, MAX_PEAKS> breaths;   // snr >= breath_hyp_db
+};
+
+// Caller-owned scratch of one long-window analysis (~125 KB: PSRAM on the
+// device, one instance, main task). LinkProcessor::stillLongRows() fills rows;
+// analyzeLong() leaves the band power of the last analysis in spectrum.
+struct LongWork {
+    int16_t rows[DSP_LONG_LEN][DSP_NSEL];
+    float   y[DSP_LONG_LEN];
+    int32_t x[DSP_LONG_LEN];
+    float   spectrum[LONG_SPEC_MAX];
+    int     n_spec = 0;
+    float   spec_fmin_bpm = 0, spec_bin_bpm = 0;
 };
 
 // Everything analyzeLink() needs besides the breathing series. Taken under the
@@ -228,12 +277,21 @@ public:
     // max_rows; advances *cursor. A cursor older than the window skips ahead.
     int rowsSince(uint32_t* cursor, int16_t* out, int max_rows) const;
 
+    // Long-history rows (LONG_HZ grid, oldest first, Q4, nSel() columns) since
+    // motion last ended, at most max_rows; 0 unless the last snapshot() found
+    // the link still long enough for vitals. Caller holds the lock.
+    int stillLongRows(int64_t now_us, int16_t (*out)[DSP_NSEL], int max_rows) const;
+
 private:
     static constexpr int kBreathLen = DSP_BREATH_LEN;
+    static constexpr int kLongLen = DSP_LONG_LEN;
+    static constexpr int kLongDecim = DSP_DECIM_HZ / LONG_HZ;
     static constexpr int kHampel = 7;
 
     void selectSubcarriers(const CsiFrame& f);
     void flushBreathSlot();
+    // Appends one breathing-grid row; every kLongDecim rows, their mean to the long history.
+    void storeRow(const int16_t* row);
     void motionSample(int32_t spread_q16);
     // First principal component of the linearly detrended selected subcarriers
     // over the newest max_rows of the breathing window, into y[kBreathLen].
@@ -259,6 +317,13 @@ private:
     uint32_t bacc_[DSP_NSEL] = {};   // Q4 amplitude sums of the current breathing slot
     uint16_t bacc_n_ = 0;
 
+    // Long history: means of kLongDecim breathing rows, Q4. ~96 KB/link.
+    int16_t lring_[kLongLen][DSP_NSEL] = {};
+    int lhead_ = 0;
+    int lcount_ = 0;
+    int32_t lacc_[DSP_NSEL] = {};
+    uint8_t lacc_n_ = 0;
+
     // Motion, all integer: Hampel window of the per-frame spread (CV, Q16), then
     // a sliding variance (Q32) over MOTION_WIN_PKTS frames with exact sums.
     static constexpr uint64_t kSpreadMax = 1u << 20;     // CV <= 16
@@ -281,6 +346,7 @@ private:
     bool motion_ = false;
     uint8_t votes_ = 0;              // last 6 raw decisions, bit 0 = newest
     int64_t last_motion_us_ = -1;    // also the start of the idle timer
+    bool vitals_ok_ = false;         // last snapshot(): still long enough for vitals
     int64_t rate_t_us_ = -1;
     uint32_t rate_frames_ = 0;
     float pkt_rate_ = 0;
@@ -290,6 +356,12 @@ private:
 // from its snapshot and breathing series. Pure, lock-free; uses one static
 // scratch buffer, so call from one task only.
 LinkResult analyzeLink(const LinkSnapshot& s, const float* y);
+
+// Breathing hypotheses of the n_rows x n_sel long-history rows in w.rows (from
+// stillLongRows), outside any lock. Needs LONG_MIN_SEC of rows; the window's
+// resolution sets the bin width (max(30/T, 0.1) bpm: 0.25 bpm at 120 s). Leaves
+// the band power in w.spectrum. Uses only w: one LongWork per task.
+LongResult analyzeLong(LongWork& w, int n_rows, int n_sel);
 
 // Web views of a breathing series y[0..n): band spectrum (1 bin per bpm from
 // BREATH_FMIN_HZ*60, Hann-windowed), waveform over the whole window
@@ -317,6 +389,10 @@ struct SceneResult {
     int   heart_count = 0;             // clusters at detection SNR
     FixedVec<SpectralPeak, MAX_PEAKS> hearts;
     int   active_links = 0;
+    // Long-window evidence (not used for presence or counts: the tracker decides those).
+    float long_window_s = 0;           // longest still history among the links
+    FixedVec<SpectralPeak, MAX_PEAKS> long_breaths;   // clustered across links
+    int   long_count = 0;              // clusters at long_snr_db
 };
 
 // Cluster per-link breathing peaks into distinct breathers.

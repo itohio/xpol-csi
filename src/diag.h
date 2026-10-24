@@ -12,9 +12,10 @@ struct DiagTask { char name[16]; uint16_t permille; };   // CPU share since the 
 
 struct DiagStats {
     uint16_t      loop_ms = 0;        // main-loop work per tick
-    uint32_t      heap_free = 0;      // now
-    uint32_t      heap_min_int = 0;   // lowest over the last update interval (2 s)
-    uint32_t      heap_min = 0;       // lowest since boot
+    uint32_t      heap_free = 0;      // internal RAM now
+    uint32_t      heap_min_int = 0;   // lowest internal RAM over the last update interval (2 s)
+    uint32_t      heap_min = 0;       // lowest internal RAM since boot
+    uint32_t      psram_free = 0;     // external PSRAM now
     uint8_t       cpu_busy = 0;       // % not IDLE over the last interval
     uint16_t      csi_fps = 0;        // CSI frames/s into the ring
     SensingHealth csi{};

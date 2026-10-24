@@ -37,8 +37,9 @@ void sensing_reset_buffers();
 bool sensing_save_params();
 
 // Per-link results for this tick. Each link is snapshotted under the sensing
-// lock (motion decision + breathing series) and analysed after releasing it.
-// Main task only. Returns link count (<= MAX_LINKS).
+// lock (motion decision + breathing series) and analysed after releasing it;
+// one still link per tick also gets a long-window analysis (LinkResult.long_*
+// carries each link's latest). Main task only. Returns link count (<= MAX_LINKS).
 int  sensing_snapshot(LinkView* out, int max);
 
 // Views from the last sensing_snapshot(): the still link with the highest mean
@@ -47,15 +48,22 @@ FixedVec<float, SPEC_MAX> sensing_spectrum();
 FixedVec<float, HSPEC_MAX> sensing_heart_spectrum();
 float sensing_wave_point(bool* valid);   // newest waveform point (mean of the last tick's samples)
 float sensing_phase(float bpm);
+// That link's last long-window band power (n = 0: none yet); p stays valid
+// until the next sensing_snapshot(). Main task only.
+struct LongSpectrum { float fmin_bpm, bin_bpm, window_s; int n; const float* p; };
+LongSpectrum sensing_long_spectrum();
 // A link delivered >= 5 byte-identical frames in a row within the last 3 s.
 bool  sensing_csi_frozen();
 
 // CSI reader-vs-writer health: frames dropped because the ring was full and
 // frames written (both cumulative), the largest backlog (written - consumed) and
-// ring bytes (size, used now, peak) since the previous call.
+// ring bytes (size, used now, peak) since the previous call; and the main
+// task's longest hold of the link lock (the consumer waits that long), longest
+// long-window analysis and their count.
 struct SensingHealth {
     uint32_t drops, written, max_backlog;
     uint32_t ring_size, ring_used, ring_peak;
+    uint32_t lock_max_us, long_max_us, long_runs;
 };
 SensingHealth sensing_health();   // resets the peaks: diag_update() is the only caller
 

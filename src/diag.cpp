@@ -54,17 +54,20 @@ void diag_update(int loop_ms) {
 
     DiagStats s;
     s.loop_ms = (uint16_t)loop_ms;
-    s.heap_free = esp_get_free_heap_size();
+    // Internal SRAM only: the Wi-Fi driver allocates there (PSRAM holds the
+    // link histories and is reported apart).
+    s.heap_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s.psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     // Lowest free heap since the previous update (2 s): the dips that matter
     // (the Wi-Fi driver starving) last milliseconds, so a sample of "free now"
     // misses them and the lifetime minimum never recovers.
     if (monitoring) {
-        s.heap_min_int = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+        s.heap_min_int = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
         heap_caps_monitor_local_minimum_free_size_stop();
     } else {
         s.heap_min_int = s.heap_free;
     }
-    s.heap_min = esp_get_minimum_free_heap_size();   // lifetime (monitor stopped)
+    s.heap_min = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);   // lifetime (monitor stopped)
     monitoring = heap_caps_monitor_local_minimum_free_size_start() == ESP_OK;
     s.csi = sensing_health();
     s.csi_fps = last_us ? (uint16_t)((uint64_t)(s.csi.written - last_written) * 1000000 / (uint64_t)(now - last_us)) : 0;
@@ -75,7 +78,7 @@ void diag_update(int loop_ms) {
     s.cpu_busy = (uint8_t)std::min(100, (1000 - std::min<int>(idle, 1000) + 5) / 10);
 
     BoardStatus b{};
-    b.heap_free = s.heap_free; b.heap_min = s.heap_min_int; b.cpu_busy = s.cpu_busy;
+    b.heap_free = s.heap_free; b.heap_min = s.heap_min_int; b.psram_free = s.psram_free; b.cpu_busy = s.cpu_busy;
     b.tx_q = (int8_t)radio_tx_power_q(); b.illum_hz = (uint16_t)radio_illuminator_rate();
     b.csi_fps = s.csi_fps; b.csi_restarts = (uint16_t)radio_csi_restarts(); b.frozen = sensing_csi_frozen() ? 1 : 0;
     portENTER_CRITICAL(&s_mux);
@@ -87,6 +90,10 @@ void diag_update(int loop_ms) {
                   loop_ms, (unsigned)s.cpu_busy, (unsigned)s.heap_free, (unsigned)s.heap_min_int, (unsigned)s.heap_min,
                   (unsigned)s.csi_fps, (unsigned)s.csi.drops, (unsigned)radio_csi_stale(), (unsigned)radio_csi_restarts(),
                   (unsigned)s.csi.max_backlog, (unsigned)s.csi.ring_used, (unsigned)s.csi.ring_size, (unsigned)s.csi.ring_peak);
+    // heap above is internal RAM; PSRAM and the main task's link-lock hold and
+    // long-window analyses (count, longest) since the previous line.
+    telem_comment("load psram=%u lock_max=%uus long_runs=%u long_max=%uus",
+                  (unsigned)s.psram_free, (unsigned)s.csi.lock_max_us, (unsigned)s.csi.long_runs, (unsigned)s.csi.long_max_us);
     char line[220];
     int len = snprintf(line, sizeof(line), "cpu");
     for (int i = 0; i < s.ntask && i < 8 && len < (int)sizeof(line) - 24; i++)

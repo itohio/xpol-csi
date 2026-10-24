@@ -13,6 +13,8 @@ struct WebRf {
     char  mac[24] = {0};
     float coupling = 0;   // mean CSI amplitude (AGC-normalised)
     int   rssi = 0;
+    bool  used = false;   // its CSI feeds the scene ("links per board")
+    float long_bpm = 0, long_snr = 0;   // strongest long-window peak (0: none)
     void set_label(const char* hexmac, const char* fmt_label) {
         snprintf(mac, sizeof(mac), "%s %s", hexmac, fmt_label);
     }
@@ -53,4 +55,10 @@ struct WebScene {
     float wave_point = 0;                        // newest breathing-waveform point (mean of the last tick)
     bool  wave_valid = false;                    // a still window exists
     FixedVec<WebRf, MAX_LINKS> rf;               // this board's links (coupling, RSSI)
+    // Long-window evidence: the scene's clustered peaks, and the strongest still
+    // link's band power (lspec_bin_bpm per bin from lspec_fmin_bpm).
+    float long_window_s = 0, long_detect_db = 0;
+    FixedVec<SpectralPeak, MAX_PEAKS> long_breaths;
+    FixedVec<float, LONG_SPEC_MAX> lspectrum;
+    float lspec_fmin_bpm = 0, lspec_bin_bpm = 0, lspec_window_s = 0;
 };

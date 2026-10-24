@@ -25,6 +25,13 @@ static void put_amp(int8_t* iq, int k, float amp) {
 }
 
 static float s_y[DSP_BREATH_LEN];
+static LongWork s_long;
+
+// One long-window analysis as the firmware runs it after a snapshot.
+static LongResult long_eval(LinkProcessor& p, int64_t now_us) {
+    const int n = p.stillLongRows(now_us, s_long.rows, (int)(g_dsp.long_window_s * LONG_HZ));
+    return analyzeLong(s_long, n, p.nSel());
+}
 
 // One firmware tick: snapshot (under the lock in firmware) + analysis.
 static LinkResult eval(LinkProcessor& p, int64_t now_us) {
@@ -290,6 +297,76 @@ int main() {
         check(b_ok && h_ok, "bands stay ordered and within their bin buffers");
         check(nan_rejected && rounded, "NaN rejected, integer params rounded");
         check(g_dsp.breath_snr_db == BREATH_SNR_DB && g_dsp.hampel_x1e4 == 44478, "defaults restore derived values");
+    }
+
+    // --- Test 13: a weak, steady breather. The 24 s window has no detection near
+    // it; 120 s of still history finds 13.4 bpm at detection SNR, on 0.25 bpm bins. ---
+    {
+        LinkProcessor p;
+        uint32_t t = run(p, 0, 135.0f, breathing(13.4f, 0.0015f));
+        const LinkResult r = eval(p, t);
+        const LongResult L = long_eval(p, t);
+        for (auto& b : r.breaths) printf("Test13 24 s window: %.2f bpm, %.1f dB\n", b.rate_bpm, b.snr);
+        for (auto& b : L.breaths) printf("Test13 long window (%.0f s, %.2f bpm bins): %.2f bpm, %.1f dB\n", L.window_s, s_long.spec_bin_bpm, b.rate_bpm, b.snr);
+        check(!has_rate(r.breaths, 13.4f, 0.5f, g_dsp.breath_snr_db), "24 s window: no detection within 0.5 bpm");
+        check(L.window_s == 120.0f && s_long.spec_bin_bpm == 0.25f, "long window = 120 s of still history, 0.25 bpm bins");
+        check(has_rate(L.breaths, 13.4f, 0.1f, g_dsp.long_snr_db), "long window: 13.4 bpm within 0.1 bpm at detection SNR");
+    }
+
+    // --- Test 14: the long window only covers stillness: none before LONG_MIN_SEC,
+    // none while moving, and motion restarts it. ---
+    {
+        LinkProcessor p;
+        uint32_t t = run(p, 0, 40.0f, breathing(15.0f, 0.08f));
+        const LongResult early = long_eval(p, t);
+        t = run(p, t, 60.0f, breathing(15.0f, 0.08f));
+        const LongResult ready = long_eval(p, t);
+        float walk[NSUB] = {};
+        t = run(p, t, 3.0f, [&](int k, float) {
+            walk[k] += 0.15f * base_amp(k) * frand();
+            if (fabsf(walk[k]) > 0.6f * base_amp(k)) walk[k] *= 0.5f;
+            return base_amp(k) + walk[k] + 0.5f * frand();
+        });
+        eval(p, t);
+        const int moving_rows = p.stillLongRows(t, s_long.rows, DSP_LONG_LEN);
+        t = run(p, t, 30.0f, breathing(15.0f, 0.08f));
+        const LongResult after = long_eval(p, t);
+        printf("Test14 windows: 40 s still %.0f s, 100 s still %.0f s, moving rows %d, 30 s after motion %.0f s\n",
+               early.window_s, ready.window_s, moving_rows, after.window_s);
+        check(early.window_s == 0 && early.breaths.empty(), "no long result before 48 s of stillness");
+        check(ready.window_s >= 99.0f && has_rate(ready.breaths, 15.0f, 0.3f, g_dsp.long_snr_db), "long result once still long enough");
+        check(moving_rows == 0, "no long-history rows while moving");
+        check(after.window_s == 0, "motion restarts the long window");
+    }
+
+    // --- Test 15: the 10 min history wraps and still caps the window. ---
+    {
+        LinkProcessor p;
+        const float saved = g_dsp.long_window_s;
+        g_dsp.long_window_s = (float)LONG_HIST_SEC;
+        uint32_t t = run(p, 0, 700.0f, breathing(16.2f, 0.02f));
+        const LongResult L = long_eval(p, t);
+        g_dsp.long_window_s = saved;
+        for (auto& b : L.breaths) printf("Test15 %.0f s window (%.2f bpm bins): %.2f bpm, %.1f dB\n", L.window_s, s_long.spec_bin_bpm, b.rate_bpm, b.snr);
+        check(L.window_s == (float)LONG_HIST_SEC, "window capped at the history length after it wrapped");
+        check(has_rate(L.breaths, 16.2f, 0.05f, g_dsp.long_snr_db), "rate exact across the wrap");
+    }
+
+    // --- Test 16: long-window peaks cluster across links and decide nothing. ---
+    {
+        FixedVec<LinkResult, MAX_LINKS * 2> links;
+        LinkResult a, b, c;
+        a.valid = b.valid = c.valid = true;
+        a.long_window_s = 120; a.long_breaths.push_back({13.4f, 16.0f});
+        b.long_window_s = 300; b.long_breaths.push_back({13.6f, 19.0f});
+        c.long_window_s = 120; c.long_breaths.push_back({21.0f, 9.0f});
+        links.push_back(a); links.push_back(b); links.push_back(c);
+        const SceneResult s = fuseLinks(links);
+        printf("Test16 long clusters: %zu, count %d, window %.0f s\n", s.long_breaths.size(), s.long_count, s.long_window_s);
+        check(s.long_breaths.size() == 2 && s.long_breaths[0].snr == 19.0f && fabsf(s.long_breaths[0].rate_bpm - 13.5f) < 0.1f,
+              "one cluster per rate, SNR the max, rate SNR-weighted");
+        check(s.long_count == 1 && s.long_window_s == 300, "long-window detections counted apart");
+        check(!s.presence && s.breather_count == 0, "long-window peaks set neither presence nor breathers");
     }
 
     printf(s_fail ? "\n%d CHECK(S) FAILED\n" : "\nALL CHECKS PASSED\n", s_fail);

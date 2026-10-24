@@ -26,9 +26,6 @@ static MsgChannelAgree  s_agree = {};
 static volatile bool    s_have_peer_survey = false;
 static MsgSurvey        s_peer_survey = {};
 
-static LinkResult s_peer_links[MAX_LINKS];
-static int64_t    s_peer_ts[MAX_LINKS] = {0};
-
 static uint8_t s_channel = SENSE_CH_FALLBACK;
 static Mode    s_mode = DEFAULT_MODE;
 
@@ -52,10 +49,7 @@ static void on_msg(MsgType t, const uint8_t* p, uint16_t len) {
             if (len >= sizeof(MsgChannelAgree)) { memcpy(&s_agree, p, sizeof(s_agree)); s_agreed = true; }
             break;
         case MsgType::FEATURE_REPORT:
-            if (len >= sizeof(MsgFeature)) {
-                const MsgFeature* f = (const MsgFeature*)p;
-                if (f->link_id < MAX_LINKS) { s_peer_links[f->link_id] = link_from_feature(*f); s_peer_ts[f->link_id] = esp_timer_get_time(); }
-            }
+            if (len >= sizeof(MsgFeature)) peer_links_store(*(const MsgFeature*)p, esp_timer_get_time());
             break;
         case MsgType::RF_SOURCES:
             if (len >= offsetof(MsgRfSources, src)) diag_set_peer_sources(*(const MsgRfSources*)p, len);
@@ -108,6 +102,7 @@ void app_run() {
     MARK("telem ok");
     election_init();
     MARK("election ok");
+    peer_links_init();   // before the UART task can deliver FEATURE_REPORTs
     link_init(on_msg);
     MARK("link ok");
     radio_wifi_start(false);
@@ -202,9 +197,7 @@ void app_run() {
     telem_start_input(status_cb, calibrate_cb);
 
     // --- main loop ---
-    // ~3 KB with 6 links: static, off the 8 KB main stack (single main loop).
-    static LinkView views[MAX_LINKS];
-    static FixedVec<LinkResult, MAX_LINKS * 2> all;
+    FusionWork& w = fusion_work();   // PSRAM: views and fusion input
     int tick = 0;
     int64_t recalib_until = 0;
     for (;;) {
@@ -214,25 +207,27 @@ void app_run() {
         if (s_recalib) { s_recalib = false; sensing_begin_calibration(); recalib_until = esp_timer_get_time() + (int64_t)CALIB_SECONDS * 1000000; telem_event("recalibrating"); }
         if (recalib_until && esp_timer_get_time() > recalib_until) { sensing_finalize_calibration(); recalib_until = 0; telem_event("recalibration done"); }
 
-        int n = sensing_snapshot(views, MAX_LINKS);
-        all.clear();
+        int n = sensing_snapshot(w.views, MAX_LINKS);
+        w.all.clear();
         bool emit_feat = (tick % 2) == 0;  // ~2 Hz
         for (int i = 0; i < n; i++) {
-            all.push_back(views[i].result);
-            if (emit_feat) telem_feat(views[i].mac, views[i].result);
+            const LinkView& v = w.views[i];
+            w.all.push_back(v.result);
+            if (emit_feat) telem_feat(v.mac, v.result);
             if (!election_is_leader()) {
-                MsgFeature f = feature_from_link((uint8_t)i, views[i].mac, views[i].fmt, views[i].result);
+                MsgFeature f = feature_from_link((uint8_t)i, v.mac, v.fmt, v.result);
                 link_send(MsgType::FEATURE_REPORT, &f, sizeof(f));
             }
         }
 
         if (election_is_leader()) {
-            int64_t now = esp_timer_get_time();
+            const int64_t now = esp_timer_get_time();
+            const PeerLink* peers = peer_links();
             for (int i = 0; i < MAX_LINKS; i++)
-                if (s_peer_ts[i] && now - s_peer_ts[i] < 2000000) all.push_back(s_peer_links[i]);
+                if (peers[i].ts_us && now - peers[i].ts_us < 2000000) w.all.push_back(peers[i].r);
         }
 
-        SceneResult scene = fuseLinks(all);
+        SceneResult scene = fuseLinks(w.all);
         scene.presence = scene.presence || scene.breather_count > 0;   // no tracker in this build
         if (s_ap_up) scene_state_set(scene, s_mode, s_channel);
         telem_scene(scene, s_channel, s_mode);

@@ -1,6 +1,7 @@
 #include "node_common.h"
 #include "config.h"
 #include "esp_wifi.h"
+#include "psram.h"
 #include "radio.h"
 #include "sensing.h"
 #include "link.h"
@@ -25,6 +26,10 @@ MsgFeature feature_from_link(uint8_t link_id, const uint8_t* mac, uint8_t fmt, c
     int nh = (int)r.hearts.size(); if (nh > FEAT_MAX_HEART) nh = FEAT_MAX_HEART;
     m.n_heart = (uint8_t)nh;
     for (int i = 0; i < nh; i++) { m.heart_bpm[i] = r.hearts[i].rate_bpm; m.heart_snr[i] = r.hearts[i].snr; }
+    m.long_window_s = r.long_window_s;
+    int nl = (int)r.long_breaths.size(); if (nl > FEAT_MAX_BREATH) nl = FEAT_MAX_BREATH;
+    m.n_long = (uint8_t)nl;
+    for (int i = 0; i < nl; i++) { m.long_bpm[i] = r.long_breaths[i].rate_bpm; m.long_snr[i] = r.long_breaths[i].snr; }
     return m;
 }
 
@@ -39,7 +44,33 @@ LinkResult link_from_feature(const MsgFeature& m) {
         r.breaths.push_back({ m.breath_bpm[i], m.breath_snr[i] });
     for (int i = 0; i < m.n_heart && i < FEAT_MAX_HEART; i++)
         r.hearts.push_back({ m.heart_bpm[i], m.heart_snr[i] });
+    r.long_window_s = m.long_window_s;
+    for (int i = 0; i < m.n_long && i < FEAT_MAX_BREATH; i++)
+        r.long_breaths.push_back({ m.long_bpm[i], m.long_snr[i] });
     return r;
+}
+
+static PeerLink* s_peer = nullptr;
+
+void peer_links_init() {
+    if (!s_peer) s_peer = psram_new_array<PeerLink>(MAX_LINKS, "peer links");
+}
+
+void peer_links_store(const MsgFeature& f, int64_t now_us) {
+    if (!s_peer || f.link_id >= MAX_LINKS) return;
+    PeerLink& p = s_peer[f.link_id];
+    p.r = link_from_feature(f);
+    memcpy(p.mac, f.mac, 6);
+    p.fmt = f.fmt;
+    p.ts_us = now_us;
+}
+
+PeerLink* peer_links() { return s_peer; }
+
+FusionWork& fusion_work() {
+    static FusionWork* w = nullptr;
+    if (!w) w = psram_new<FusionWork>("fusion scratch");
+    return *w;
 }
 
 // Which transmitters' CSI the scene used on the last tick, per receiving board.

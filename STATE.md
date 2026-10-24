@@ -18,7 +18,7 @@ recordings are needed after the antenna is re-aligned.
 | channel | the leader picks the quietest surveyed channel at boot (by design); 153 in all valid recordings |
 | TX power | 14 dBm on both boards at boot (`TX_POWER_DBM`) |
 | illumination | both boards, ESP-NOW broadcast, 100 Hz, HT20 MCS0 |
-| sensing | `MAX_LINKS=3` per board, 20 Hz breathing grid, breath detect 14 dB |
+| sensing | recordings below: `MAX_LINKS=3` per board, 20 Hz breathing grid, breath detect 14 dB. Branch `psram-long-history` (not yet on the boards): 16 link slots per board in PSRAM, 3 feed the scene by default, plus a 10 min per-link history with a long-window breathing analysis (README, DSP) |
 
 ## What changed in the last two days
 
@@ -75,6 +75,8 @@ frame fluctuation ≈ 0.7 amplitude units (quantization + thermal noise).
 | PC1 breathing peak, 60 s windows, median dB | 7.6 | 7.1–8.1 | 9.1 (up to 17.3) |
 | 10-min averaged spectrum vs empty, < 20 bpm | — | +0 / +0.5–1 / +0.5–1 dB | +0.9 to +1.5 dB |
 | same, 48–120 bpm (outside breathing) | — | ±0.2 / +0.5–0.7 / +0.6–0.7 dB | +0.2 dB |
+| long window (firmware DSP replay, `--long`), strongest peak, max dB: 120 s (leader / follower) | 10.7 / 9.5 | 10.3–10.9 / 9.0–11.7 | 11.4 (leader) |
+| same, 300 s windows | 8.9 / 9.5 | 9.7–10.9 / 9.3–11.3 | 11.6 |
 
 - **Sleepers: not detected.** No breathing line in any sleep session. Sleep 2
   and 3 sit slightly above the empty room across all bands (broadband, not
@@ -83,6 +85,13 @@ frame fluctuation ≈ 0.7 amplitude units (quantization + thermal noise).
   low-frequency energy and as motion around minute 5.
 - One probable turn-over in sleep 3 (both receivers flag motion around minutes
   5–7).
+- **Long window (replayed Oct 22):** no peak reaches the 14 dB default in any
+  session, or 12 dB; the empty room peaks at 10.7 dB, the sleep sessions at
+  11.7 dB (follower, sleep 1, 12.3–12.5 bpm). It does not separate the sleepers
+  either: the evidence still points at isolation, not window length. The 120 s
+  windows are mostly reached; 300 s ones only occasionally (motion restarts the
+  window) and 600 s never in 10 min sessions. One empty-room session is thin
+  evidence for the long-window threshold.
 
 ### Isolation history
 

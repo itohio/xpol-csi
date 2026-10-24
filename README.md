@@ -160,7 +160,7 @@ uv run python record_session.py empty 120     # both boards: raw I/Q + telemetry
 uv run python align.py                         # live: each board's level from the other (antenna alignment)
 uv run --with numpy python analyze_session.py data/present-1101-*.log data/empty-1101-*.log
 c++ -std=c++17 -O2 -I../src replay.cpp ../src/dsp.cpp -o /tmp/replay
-/tmp/replay data/present-1101-*.log --thr 10bda3cedaac=2.5e-05 [--spectrum] > replay.csv
+/tmp/replay data/present-1101-*.log --thr 10bda3cedaac=2.5e-05 [--spectrum] [--long] [--param "long window=300"] > replay.csv
 ```
 
 `record_session.py` sends `r` (raw dump on) and `q` (off). `analyze_session.py`
@@ -168,7 +168,9 @@ reports, per link ≥ 20 frames/s, RSSI, temporal CV and band powers (breathing,
 heart, motion) of the amplitude and of the adjacent-subcarrier phase.
 `replay.cpp` runs a recording through the exact firmware DSP (`src/dsp.cpp`)
 at the firmware's 4 Hz tick; `--thr` takes the threshold printed by
-`# calibrated <mac> motion_threshold=...`.
+`# calibrated <mac> motion_threshold=...`; `--long` adds each link's
+long-window analysis (`L,t_s,mac,window_s,bin_bpm,bpm:dB;..`, on the firmware's
+schedule; `--spectrum` also prints its band power as `LS` rows).
 
 ### Telemetry line protocol (`src/telemetry.h`)
 
@@ -180,13 +182,16 @@ CH,<t_ms>,<channel>,<second>,<band5g>
 CSI,<t_ms>,<src_mac>,<rssi>,<noise>,<nsub>,<a0> a1 ... aN-1>     (verbose only, 'v')
 IQ,<t_us>,<src_mac>,<rssi>,<noise>,<gain_q8>,<nsub>,<hex int8 I0 Q0 I1 Q1 ...>   (raw dump, 'r')
 FEAT,<t_ms>,<src_mac>,<valid>,<motion>,<is_motion>,<rate>,<nb>,<bpm:snr;..>,<nh>,<bpm:snr;..>
+LONG,<t_ms>,<src_mac>,<window_s>,<nb>,<bpm:snr;..>      (a link's long-window analysis; evidence only)
 SCENE,<t_ms>,<presence>,<motion>,<links>,<nb>,<bpm:snr;..>,<nh>,<bpm:snr;..>
 ```
 
-Every 2 s the main loop also prints its health:
+Every 2 s the main loop also prints its health (`heap` is internal SRAM, the
+memory the Wi-Fi driver needs; the link histories are in PSRAM):
 
 ```
 # health loop=<ms per tick> csi_drops=<ring overflows> csi_stale=<frames flagged without a channel estimate> csi_restarts=<CSI restarts since boot> csi_backlog_max=<frames> ring=<used>/<size> peak=<bytes> heap=.. min=..
+# load psram=<free bytes> lock_max=<longest hold of the link lock by the main task, us> long_runs=<long-window analyses> long_max=<longest one, us>
 # cpu IDLE=90.2% main=5.7% wifi=2.3% csi_consume=0.5% ...    (single core: shares add to ~100%)
 ```
 
@@ -239,9 +244,9 @@ decoders in `web/src/wire.js`.
 
 | message | rate | tabs | content |
 |---|---|---|---|
-| STATUS `0xC0` (40 B) | 1 Hz | all | channel, links per board; per board: CPU %, free heap now and its 2 s minimum, TX power, illumination rate, CSI frames/s, CSI restarts, frozen flag |
-| SCENE `0xC5` (~80 B) | 4 Hz | overview, graphs, tune | presence, motion index, tracks (rate ± CI, SNR, confidence, heart), this board's links |
-| SPECTRA `0xC9` (~160 B) | 4 Hz | graphs, tune | breathing and heart-band spectra (i8 half-dB over the median bin), one waveform point |
+| STATUS `0xC0` (48 B) | 1 Hz | all | channel, links per board, link slots per board; per board: CPU %, free internal RAM now and its 2 s minimum, free PSRAM, TX power, illumination rate, CSI frames/s, CSI restarts, frozen flag |
+| SCENE `0xC5` (~0.2–0.9 KB) | 4 Hz | overview, graphs, tune | presence, motion index, tracks (rate ± CI, SNR, confidence, heart), this board's links (feeds the scene, strongest long-window peak), the scene's long-window peaks |
+| SPECTRA `0xC9` (~0.2–0.7 KB) | 4 Hz | graphs, tune | breathing and heart-band spectra (i8 half-dB over the median bin), one waveform point, the strongest still link's long-window spectrum (fractional bins) |
 | RAW `0xC6` (≤ 520 B) | 4 Hz | raw | the strongest link's new breathing-grid rows since the last message (16 subcarriers, i16 Q4) |
 | RADIO `0xC8` (~350 B) | 1 Hz | radio | TX powers, both boards' RF source tables, per-task CPU, CSI ring |
 
@@ -252,8 +257,9 @@ and TX power, forwarded over the UART as `ILLUM_SET` and repeated every 2 s),
 returns the self-describing parameter table. No authentication: anyone on the
 network can change parameters.
 
-A one-line footer on every tab shows each board's CPU, free heap (↓ = lowest in
-the last 2 s), TX power, illumination and CSI rate, red when its CSI is frozen.
+A one-line footer on every tab shows each board's CPU, free internal RAM (↓ =
+lowest in the last 2 s; below 12 KB the Wi-Fi driver is at risk), free PSRAM,
+TX power, illumination and CSI rate, red when its CSI is frozen.
 
 ### Radio tab (web)
 
@@ -297,22 +303,23 @@ firmware unchanged.
   nothing) + 10·log10(frames/s) (averaging gain per slot). E.g. −25 dBm at
   100 fr/s = 95 dB, −55 dBm at 100 fr/s = 65 dB, −25 dBm at 5 fr/s = 82 dB.
 - **Admission** — up to `MAX_LINKS` links per board (build flag,
-  `sensing_flags` in `platformio.ini`: 3 at the 20 Hz grid, or 6 at 10 Hz for
-  the same RAM). Every other transmitter/format is a candidate measured over
+  `sensing_flags` in `platformio.ini`: 16; each slot is ~112 KB of PSRAM, see
+  **Memory**). Every other transmitter/format is a candidate measured over
   2 s windows (rate, mean RSSI); it needs half of `min link rate` (so the
   router's data qualifies, beacon-only APs do not), takes a free slot, or
   replaces the weakest link (older than 30 s) once its quality beats it by 3 dB
-  for 10 s straight. Links silent for 10 s are freed.
+  for 10 s straight. Links silent for 10 s are freed. Every admitted link is
+  analysed and reported (FEAT/LONG lines, web links).
 - **Which links feed the scene** (`src/link_select.h`, host test
-  `host/test_link_select.cpp`) — of the valid links on both boards (frame rate
+  `host/test_link_select.cpp`) — of the valid links on each board (frame rate
   ≥ `min link rate`, measured as a 5 s EMA, leaving only below 75 % of it; full
-  motion window), the best `links fused` (tune tab, 1…2×`MAX_LINKS`: each
-  board holds `MAX_LINKS` links and the leader chooses among both boards') by
-  quality smoothed over 5 s. A link must be valid for 10 s straight before it
-  can be chosen (a router's bursty data never flickers in); a chosen link
-  stays at least 20 s; another replaces it only after being 3 dB better for
-  5 s without a break; a link that stops being valid leaves at once. The radio
-  tab shows them as **used** (green RSSI).
+  motion window), the best `links per board` (tune tab, 1…`MAX_LINKS`, default
+  3, the same cap for both boards) by quality smoothed over 5 s. A link must be
+  valid for 10 s straight before it can be chosen (a router's bursty data never
+  flickers in); a chosen link stays at least 20 s; another replaces it only
+  after being 3 dB better for 5 s without a break; a link that stops being
+  valid leaves at once. The radio tab shows them as **used** (green RSSI), the
+  overview's link list as **scene**.
 - **Low-cut** — before the breathing component and both spectra, each
   subcarrier has its centered moving average over `low-cut window` (tune tab,
   default 8 s, 0 = off) subtracted. Slow intensity changes (drift, AGC/gain
@@ -342,6 +349,30 @@ firmware unchanged.
   sidelobes. 14 dB: white noise p99.9 is 13.5 dB; the empty-room recordings
   exceed it in 0–0.7% of still ticks, which the tracker absorbs. Two people
   closer than ~5 bpm are one peak; expect "1" or "≥2", not exact counts.
+- **Long window** — every link also keeps 10 min (`LONG_HIST_SEC`) of its
+  16 subcarriers at 5 Hz. Once it has been still for ≥ 48 s, the still part of
+  that history, up to `long window` (tune tab, 60–600 s, default 120), goes
+  through the same principal component and Hann periodogram, with bins of
+  max(30/T, 0.1) bpm (0.25 bpm at 120 s; the 24 s window resolves 2.5 bpm) and
+  the ±120/T bpm main lobe excluded from the noise floor. One link is analysed
+  per tick (the one whose turn is oldest; each is refreshed every
+  max(2 s, T/30)), so the cost does not grow with the number of links; the
+  history is copied out under the link lock and analysed outside it. Peaks ≥
+  the hypothesis SNR are reported per link and clustered across the scene's
+  links like the 24 s ones; ≥ `long SNR (detect)` (default 14 dB) counts as a
+  long-window detection. **Evidence only**: presence and breather counts still
+  come from the 24 s tracker. On the Oct 21 recordings (14 dBm, ch 153, the
+  reworked antenna) the long window stays ≤ 10.7 dB in the empty room at 120 s
+  and ≤ 11.7 dB with the two sleepers: like the 24 s window, it does not
+  separate them at this isolation (STATE.md).
+- **Memory** — PSRAM (8 MB) is added to the capability allocator only
+  (`CONFIG_SPIRAM_USE_CAPS_ALLOC`, `src/psram.h`): the link slots (~112 KB
+  each: 24 s ring 15 KB, 10 min history 96 KB), the long-window scratch
+  (~125 KB), the per-tick fusion scratch and the web scene are allocated
+  there at boot; `malloc`, task stacks, the Wi-Fi driver, lwIP and the CSI ring
+  stay in internal SRAM (no `.bss` in PSRAM, so the Wi-Fi libraries' state does
+  not move). ~2 MB of PSRAM in use at 16 slots; internal static RAM went from
+  121 KB (3 slots) to 77 KB.
 - **Hypotheses vs detections** — every spectral peak ≥ the *hypothesis* SNR
   (default 8 dB, tunable) is reported and tracked ("forming" in the UI, with
   rate ± CI, SNR, confidence and age). A track is **confirmed** only after
@@ -382,7 +413,7 @@ breathers/heartbeats on noise-only windows**.
 
 ```
 platformio.ini        envs: node (default), verbose (CSI stream on)
-sdkconfig.defaults    flash size, CSI enable, USB console, 1 kHz tick
+sdkconfig.defaults    flash size, CSI enable, USB console, 1 kHz tick, PSRAM (caps allocator only)
 partitions.csv        8 MB layout (app + spiffs 'storage')
 src/
   config.h            pins, band/channel, DSP + vitals bands, election, telemetry
@@ -392,13 +423,14 @@ src/
   telemetry.{h,cpp}   verbose USB line protocol + CSV header + stdin commands
   radio.{h,cpp}       wifi bring-up, CSI capture, ESP-NOW illuminator, survey, AP
   dsp.{h,cpp}         motion + breathing + heartbeat detector (host-testable)
-  sensing.{h,cpp}     CSI -> per-link processors, CSI telemetry hook
+  sensing.{h,cpp}     CSI -> per-link processors (PSRAM slots), long-window scheduling, CSI telemetry hook
+  psram.h             explicit PSRAM allocation for bulk state
   link_proto.{h,cpp}  framed UART message format + CRC
   link.{h,cpp}        UART transport
   led.{h,cpp}         status LED
   scene_state.{h,cpp} thread-safe web scene + SCENE / SPECTRA encoders
   phone_http.{h,cpp}  SoftAP 10.0.0.1 + web (SPIFFS, gzip) + WebSocket views (leader)
-  node_common.{h,cpp} survey->plan, feature (de)serialization
+  node_common.{h,cpp} survey->plan, feature (de)serialization, peer link store, fusion scratch
 web/                  Vite + Preact dashboard (gzipped into the SPIFFS image)
 host/                 uv project
   monitor.py          live diagnostics (election, CSI, vitals) + record/replay
